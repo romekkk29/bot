@@ -69,6 +69,9 @@ conversation_history: dict[str, list[dict]] = {}
 # Deduplicación de webhooks ya procesados
 processed_ids: set[str] = set()
 
+# Máximo de mensajes (sin contar system prompt) a mantener por conversación
+MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "6"))
+
 
 def _build_system_prompt() -> str:
     hoy = date.today().isoformat()
@@ -230,6 +233,14 @@ async def whatsapp_webhook(request: Request):
             ]
 
         conversation_history[from_number].append({"role": "user", "content": message_text})
+
+        # Recortar historial: conservar system prompt + últimos MAX_HISTORY_TURNS mensajes
+        hist = conversation_history[from_number]
+        system_msgs = [m for m in hist if m["role"] == "system"]
+        non_system = [m for m in hist if m["role"] != "system"]
+        if len(non_system) > MAX_HISTORY_TURNS:
+            non_system = non_system[-MAX_HISTORY_TURNS:]
+        conversation_history[from_number] = system_msgs + non_system
 
         try:
             print("[WEBHOOK] Procesando con LLM...", file=sys.stderr)
