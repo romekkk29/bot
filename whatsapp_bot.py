@@ -23,7 +23,7 @@ load_dotenv()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY")
-WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "https://api.kapso.ai")
+WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "https://api.kapso.ai/meta/whatsapp/v24.0")
 
 if not GROQ_API_KEY:
     print("ERROR: Definí GROQ_API_KEY en .env", file=sys.stderr)
@@ -135,10 +135,11 @@ async def send_whatsapp_message(to_number: str, message: str, phone_number_id: s
     try:
         import httpx
 
-        if phone_number_id:
-            url = f"{WHATSAPP_API_URL}/platform/v1/whatsapp/phone_numbers/{phone_number_id}/messages"
-        else:
-            url = f"{WHATSAPP_API_URL}/platform/v1/whatsapp/messages"
+        if not phone_number_id:
+            print("[SEND] ERROR: phone_number_id no disponible", file=sys.stderr)
+            return False
+
+        url = f"{WHATSAPP_API_URL}/{phone_number_id}/messages"
 
         async with httpx.AsyncClient() as http_client:
             response = await http_client.post(
@@ -148,6 +149,8 @@ async def send_whatsapp_message(to_number: str, message: str, phone_number_id: s
                     "Content-Type": "application/json",
                 },
                 json={
+                    "messaging_product": "whatsapp",
+                    "recipient_type": "individual",
                     "to": to_number,
                     "type": "text",
                     "text": {"body": message},
