@@ -43,9 +43,27 @@ class WhatsAppMessage(BaseModel):
     message_id: str | None = None
 
 
-class WhatsAppWebhook(BaseModel):
-    event: str
-    data: dict[str, Any]
+class KapsoMessageText(BaseModel):
+    body: str | None = None
+
+
+class KapsoMessage(BaseModel):
+    id: str | None = None
+    from_: str | None = None
+    text: KapsoMessageText | None = None
+    type: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+    class Config:
+        fields = {"from_": "from"}
+
+
+class KapsoWebhook(BaseModel):
+    message: KapsoMessage | None = None
+    phone_number_id: str | None = None
+    is_new_conversation: bool | None = None
+    model_config = {"extra": "allow"}
 
 
 # Historial de conversaciones por número de teléfono
@@ -112,31 +130,33 @@ def run_turn(messages: list[dict]) -> str:
 
 
 async def send_whatsapp_message(to_number: str, message: str) -> bool:
-    """Envía mensaje a través de la API de WhatsApp/Kapso."""
+    """Envía mensaje a través de la API de Kapso."""
     if not WHATSAPP_API_KEY:
         print("WARNING: WHATSAPP_API_KEY no configurado, mensaje no enviado", file=sys.stderr)
         return False
-    
+
     try:
         import httpx
-        
+
         async with httpx.AsyncClient() as http_client:
             response = await http_client.post(
-                f"{WHATSAPP_API_URL}/messages",
+                f"{WHATSAPP_API_URL}/v1/messages",
                 headers={
                     "Authorization": f"Bearer {WHATSAPP_API_KEY}",
                     "Content-Type": "application/json",
                 },
                 json={
                     "to": to_number,
-                    "message": message,
+                    "type": "text",
+                    "text": {"body": message},
                 },
                 timeout=30.0,
             )
+            print(f"[SEND] Status: {response.status_code}, Body: {response.text}", file=sys.stderr)
             response.raise_for_status()
             return True
     except Exception as e:
-        print(f"ERROR enviando mensaje a WhatsApp: {e}", file=sys.stderr)
+        print(f"[SEND] ERROR: {e}", file=sys.stderr)
         return False
 
 
@@ -151,65 +171,55 @@ async def root():
 
 
 @app.post("/webhook/whatsapp")
-async def whatsapp_webhook(webhook: WhatsAppWebhook):
+async def whatsapp_webhook(request: Request):
     """Recibe webhooks de WhatsApp/Kapso."""
-    print(f"[WEBHOOK] Recibido: {webhook}", file=sys.stderr)
     try:
-        # Extraer datos del webhook (formato puede variar según proveedor)
-        if webhook.event == "message_received":
-            data = webhook.data
-            from_number = data.get("from", "").replace("whatsapp:", "")
-            message = data.get("message", "")
-            message_id = data.get("id")
-            
-            print(f"[WEBHOOK] De: {from_number}, Mensaje: {message}", file=sys.stderr)
-            
-            if not from_number or not message:
-                print(f"[WEBHOOK] Error: Missing from_number or message", file=sys.stderr)
-                return JSONResponse(
-                    status_code=400,
-                    content={"error": "Missing from_number or message"}
-                )
-            
-            # Obtener o crear historial
-            if from_number not in conversation_history:
-                conversation_history[from_number] = [
-                    {"role": "system", "content": _build_system_prompt()}
-                ]
-            
-            # Agregar mensaje del usuario
-            conversation_history[from_number].append({"role": "user", "content": message})
-            
-            # Procesar con el bot
-            try:
-                print(f"[WEBHOOK] Procesando mensaje...", file=sys.stderr)
-                reply = run_turn(list(conversation_history[from_number]))
-                conversation_history[from_number].append({"role": "assistant", "content": reply})
-                
-                print(f"[WEBHOOK] Respuesta: {reply}", file=sys.stderr)
-                
-                # Enviar respuesta a WhatsApp
-                sent = await send_whatsapp_message(from_number, reply)
-                print(f"[WEBHOOK] Enviado a WhatsApp: {sent}", file=sys.stderr)
-                
-                return {"status": "success", "reply": reply}
-            except Exception as e:
-                print(f"[WEBHOOK] ERROR procesando mensaje: {e}", file=sys.stderr)
-                conversation_history[from_number].pop()  # Remover mensaje del usuario
-                return JSONResponse(
-                    status_code=500,
-                    content={"error": f"Error processing message: {str(e)}"}
-                )
-        
-        print(f"[WEBHOOK] Evento ignorado: {webhook.event}", file=sys.stderr)
-        return {"status": "ignored", "event": webhook.event}
-    
+        body = await request.json()
+        print(f"[WEBHOOK] Payload: {body}", file=sys.stderr)
+
+        msg = body.get("message", {})
+        from_number = str(msg.get("from", "")).strip()
+        text_obj = msg.get("text") or {}
+        message_text = str(text_obj.get("body", "")).strip()
+
+        print(f"[WEBHOOK] De: {from_number!r}, Texto: {message_text!r}", file=sys.stderr)
+
+        if not from_number or not message_text:
+            print("[WEBHOOK] Ignorado: sin número o texto", file=sys.stderr)
+            return {"status": "ignored"}
+
+        # Solo procesar mensajes de texto entrantes
+        if msg.get("type") != "text":
+            print(f"[WEBHOOK] Ignorado: tipo {msg.get('type')}", file=sys.stderr)
+            return {"status": "ignored", "reason": "not text"}
+
+        # Obtener o crear historial
+        if from_number not in conversation_history:
+            conversation_history[from_number] = [
+                {"role": "system", "content": _build_system_prompt()}
+            ]
+
+        conversation_history[from_number].append({"role": "user", "content": message_text})
+
+        try:
+            print("[WEBHOOK] Procesando con LLM...", file=sys.stderr)
+            reply = run_turn(list(conversation_history[from_number]))
+            conversation_history[from_number].append({"role": "assistant", "content": reply})
+
+            print(f"[WEBHOOK] Respuesta: {reply}", file=sys.stderr)
+
+            sent = await send_whatsapp_message(from_number, reply)
+            print(f"[WEBHOOK] Enviado a WhatsApp: {sent}", file=sys.stderr)
+
+            return {"status": "success", "reply": reply}
+        except Exception as e:
+            print(f"[WEBHOOK] ERROR LLM: {e}", file=sys.stderr)
+            conversation_history[from_number].pop()
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
     except Exception as e:
-        print(f"[WEBHOOK] ERROR en webhook: {e}", file=sys.stderr)
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+        print(f"[WEBHOOK] ERROR general: {e}", file=sys.stderr)
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 
 @app.post("/message")
