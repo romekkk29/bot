@@ -66,6 +66,9 @@ class KapsoWebhook(BaseModel):
 # Historial de conversaciones por número de teléfono
 conversation_history: dict[str, list[dict]] = {}
 
+# Deduplicación de webhooks ya procesados
+processed_ids: set[str] = set()
+
 
 def _build_system_prompt() -> str:
     hoy = date.today().isoformat()
@@ -180,9 +183,25 @@ async def whatsapp_webhook(request: Request):
     """Recibe webhooks de WhatsApp/Kapso."""
     try:
         body = await request.json()
-        print(f"[WEBHOOK] Payload: {body}", file=sys.stderr)
 
-        msg = body.get("message", {})
+        msg = body.get("message", {}) or {}
+        msg_id = msg.get("id", "")
+
+        # Deduplicación: ignorar webhooks ya procesados
+        if msg_id and msg_id in processed_ids:
+            print(f"[WEBHOOK] Duplicado ignorado: {msg_id}", file=sys.stderr)
+            return {"status": "ignored", "reason": "duplicate"}
+        if msg_id:
+            processed_ids.add(msg_id)
+            if len(processed_ids) > 10000:
+                processed_ids.clear()
+
+        # Filtrar mensajes salientes (outbound) para evitar ecos
+        kapso_meta = msg.get("kapso") or {}
+        if kapso_meta.get("direction") == "outbound":
+            print("[WEBHOOK] Ignorado: mensaje outbound", file=sys.stderr)
+            return {"status": "ignored", "reason": "outbound"}
+
         from_number = str(msg.get("from", "")).strip()
         phone_number_id = str(body.get("phone_number_id") or "").strip() or None
         text_obj = msg.get("text") or {}
@@ -219,13 +238,23 @@ async def whatsapp_webhook(request: Request):
 
             return {"status": "success", "reply": reply}
         except Exception as e:
-            print(f"[WEBHOOK] ERROR LLM: {e}", file=sys.stderr)
+            err_str = str(e)
+            print(f"[WEBHOOK] ERROR LLM: {err_str}", file=sys.stderr)
             conversation_history[from_number].pop()
-            return JSONResponse(status_code=500, content={"error": str(e)})
+            # Notificar al usuario si se agotó el límite de tokens
+            if "rate_limit_exceeded" in err_str or "429" in err_str:
+                aviso = (
+                    "⚠️ El asistente está temporalmente no disponible por límite de uso. "
+                    "Por favor intentá de nuevo en unos minutos."
+                )
+                await send_whatsapp_message(from_number, aviso, phone_number_id)
+            # Siempre retornar 200 para evitar reintentos de Kapso
+            return {"status": "error", "detail": err_str}
 
     except Exception as e:
         print(f"[WEBHOOK] ERROR general: {e}", file=sys.stderr)
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        # Siempre 200 para evitar reintentos
+        return {"status": "error", "detail": str(e)}
 
 
 @app.post("/message")
