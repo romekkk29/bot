@@ -72,6 +72,9 @@ processed_ids: set[str] = set()
 # Máximo de mensajes (sin contar system prompt) a mantener por conversación
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "6"))
 
+# Máximo de caracteres por resultado de tool (evita payloads enormes de Supabase)
+MAX_TOOL_OUTPUT_CHARS = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "3000"))
+
 
 def _build_system_prompt() -> str:
     hoy = date.today().isoformat()
@@ -82,7 +85,12 @@ Para datos de ventas o compras (totales, listados, conteo por estado, líneas de
 Si el usuario pide períodos relativos (ej: 'último mes'), inferí fechas usando la fecha actual y llamá la tool.
 Si usaste herramientas y devolvieron datos, tratá esos datos como reales de esta consulta.
 No agregues frases de descargo genéricas como 'es solo un ejemplo', 'puede variar' o similares.
-Si falta información crítica que no puedas inferir, recién ahí pedila al usuario."""
+Si falta información crítica que no puedas inferir, recién ahí pedila al usuario.
+
+REGLA CRÍTICA — consultas sin filtro:
+Si el usuario pide "todas las ventas", "todo el detalle", "todos los productos", "todos los clientes" u otra consulta masiva SIN un filtro concreto (fecha, nombre, período, estado), NO ejecutes la herramienta.
+En cambio, respondé explicando qué filtros podés aplicar y pedí al menos uno. Ejemplos de filtros válidos: rango de fechas, nombre de producto/proveedor/cliente, estado de orden, o un período como 'hoy', 'esta semana', 'este mes'.
+Sí podés hacer consultas de resumen/totales o conteos sin filtro de fecha, ya que no devuelven filas individuales."""
 
 
 def _assistant_message_to_dict(msg) -> dict:
@@ -120,6 +128,8 @@ def run_turn(messages: list[dict]) -> str:
                 name = tc.function.name
                 raw_args = tc.function.arguments or "{}"
                 output = dispatch_tool(name, raw_args)
+                if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                    output = output[:MAX_TOOL_OUTPUT_CHARS] + "...[truncado]"
                 messages.append(
                     {
                         "role": "tool",

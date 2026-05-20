@@ -56,7 +56,8 @@ TOOLS: list[dict[str, Any]] = [
             "name": "list_sales_orders",
             "description": (
                 "Lista órdenes de venta (número, fecha, total, estado, etc.) en un rango de fechas. "
-                "Si el usuario no da fechas, llamar igual: se usa un rango por defecto (últimos días). "
+                "SOLO llamar si el usuario especificó un período concreto (hoy, esta semana, este mes, rango de fechas). "
+                "Si pide 'todas las ventas' o 'todo el detalle' sin filtro temporal, NO llamar: pedirle al usuario que acoter el período. "
                 "Usar cuando pregunten qué órdenes hay, pedidos de venta, OV, listado de ventas."
             ),
             "parameters": {
@@ -168,7 +169,7 @@ TOOLS: list[dict[str, Any]] = [
             "name": "list_purchase_orders",
             "description": (
                 "Lista órdenes de compra (OC): número, fechas, total, estado, etc. "
-                "Si no dan fechas, se usa rango por defecto (últimos días). "
+                "SOLO llamar si el usuario especificó un período concreto. Si pide 'todas las compras' sin filtro, NO llamar: pedirle que acote el período. "
                 "Usar para listados de compras, OCs pendientes, etc."
             ),
             "parameters": {
@@ -336,6 +337,7 @@ TOOLS: list[dict[str, Any]] = [
             "name": "search_products",
             "description": (
                 "Busca productos por texto (SKU/código, nombre, etc.). "
+                "Requiere un texto de búsqueda concreto; NO llamar si el usuario pide 'todos los productos' sin búsqueda. "
                 "Devuelve resultados con sku_o_codigo, nombre, precio (y id UUID si aplica). "
                 "Usar cuando pregunten por productos, nombre por SKU, listados filtrados."
             ),
@@ -364,6 +366,7 @@ TOOLS: list[dict[str, Any]] = [
             "name": "search_suppliers",
             "description": (
                 "Busca proveedores por texto (razón social, CUIT/tax_id, nombre de contacto, etc.). "
+                "Requiere un texto de búsqueda; NO llamar si el usuario pide 'todos los proveedores' sin filtro. "
                 "Devuelve id, razon_social, tax_id, contacto, email, telefono, activo. "
                 "Usar cuando pregunten por proveedores, CUIT, quién vende, datos de un supplier."
             ),
@@ -392,6 +395,7 @@ TOOLS: list[dict[str, Any]] = [
             "name": "search_customers",
             "description": (
                 "Busca clientes por texto (razón social, CUIT/tax_id, nombre de contacto, código interno, etc.). "
+                "Requiere un texto de búsqueda; NO llamar si el usuario pide 'todos los clientes' sin filtro. "
                 "Devuelve id, razon_social, tax_id, contacto, codigo, email, telefono, activo. "
                 "Usar cuando pregunten por clientes, CUIT de cliente, datos de un customer."
             ),
