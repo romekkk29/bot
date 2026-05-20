@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from groq import Groq
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from tools import TOOLS, data_backend_label, dispatch_tool
 
@@ -49,14 +49,11 @@ class KapsoMessageText(BaseModel):
 
 class KapsoMessage(BaseModel):
     id: str | None = None
-    from_: str | None = None
+    from_: str | None = Field(default=None, alias="from")
     text: KapsoMessageText | None = None
     type: str | None = None
 
     model_config = {"populate_by_name": True}
-
-    class Config:
-        fields = {"from_": "from"}
 
 
 class KapsoWebhook(BaseModel):
