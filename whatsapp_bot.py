@@ -23,7 +23,7 @@ load_dotenv()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY")
-WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "https://api.kapso.io")
+WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "https://api.kapso.ai")
 
 if not GROQ_API_KEY:
     print("ERROR: Definí GROQ_API_KEY en .env", file=sys.stderr)
@@ -126,7 +126,7 @@ def run_turn(messages: list[dict]) -> str:
         return (msg.content or "").strip()
 
 
-async def send_whatsapp_message(to_number: str, message: str) -> bool:
+async def send_whatsapp_message(to_number: str, message: str, phone_number_id: str | None = None) -> bool:
     """Envía mensaje a través de la API de Kapso."""
     if not WHATSAPP_API_KEY:
         print("WARNING: WHATSAPP_API_KEY no configurado, mensaje no enviado", file=sys.stderr)
@@ -135,11 +135,16 @@ async def send_whatsapp_message(to_number: str, message: str) -> bool:
     try:
         import httpx
 
+        if phone_number_id:
+            url = f"{WHATSAPP_API_URL}/platform/v1/whatsapp/phone_numbers/{phone_number_id}/messages"
+        else:
+            url = f"{WHATSAPP_API_URL}/platform/v1/whatsapp/messages"
+
         async with httpx.AsyncClient() as http_client:
             response = await http_client.post(
-                f"{WHATSAPP_API_URL}/v1/messages",
+                url,
                 headers={
-                    "Authorization": f"Bearer {WHATSAPP_API_KEY}",
+                    "X-API-Key": WHATSAPP_API_KEY,
                     "Content-Type": "application/json",
                 },
                 json={
@@ -176,6 +181,7 @@ async def whatsapp_webhook(request: Request):
 
         msg = body.get("message", {})
         from_number = str(msg.get("from", "")).strip()
+        phone_number_id = str(body.get("phone_number_id") or "").strip() or None
         text_obj = msg.get("text") or {}
         message_text = str(text_obj.get("body", "")).strip()
 
@@ -205,7 +211,7 @@ async def whatsapp_webhook(request: Request):
 
             print(f"[WEBHOOK] Respuesta: {reply}", file=sys.stderr)
 
-            sent = await send_whatsapp_message(from_number, reply)
+            sent = await send_whatsapp_message(from_number, reply, phone_number_id)
             print(f"[WEBHOOK] Enviado a WhatsApp: {sent}", file=sys.stderr)
 
             return {"status": "success", "reply": reply}
