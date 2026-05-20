@@ -184,6 +184,11 @@ async def whatsapp_webhook(request: Request):
     try:
         body = await request.json()
 
+        # Ignorar webhooks de prueba de Kapso
+        if body.get("test"):
+            print("[WEBHOOK] Ignorado: webhook de test", file=sys.stderr)
+            return {"status": "ignored", "reason": "test"}
+
         msg = body.get("message", {}) or {}
         msg_id = msg.get("id", "")
 
