@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import date
+from typing import Any
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -41,6 +43,80 @@ def _assistant_message_to_dict(msg) -> dict:
     return d
 
 
+def _schema_to_genai(schema: dict) -> Any:
+    from google.genai import types as _gt
+    TYPE_MAP = {
+        "string": _gt.Type.STRING, "integer": _gt.Type.INTEGER,
+        "number": _gt.Type.NUMBER, "boolean": _gt.Type.BOOLEAN,
+        "array": _gt.Type.ARRAY, "object": _gt.Type.OBJECT,
+    }
+    src = dict(schema)
+    if "anyOf" in src and "type" not in src:
+        for opt in src["anyOf"]:
+            if isinstance(opt, dict) and opt.get("type") not in (None, "null"):
+                src = {k: v for k, v in src.items() if k != "anyOf"}
+                src.update(opt)
+                break
+    t = str(src.get("type", "object")).lower()
+    kwargs: dict[str, Any] = {"type": TYPE_MAP.get(t, _gt.Type.STRING)}
+    if d := src.get("description"):
+        kwargs["description"] = d
+    if props := src.get("properties"):
+        kwargs["properties"] = {k: _schema_to_genai(v) for k, v in props.items()}
+    if req := src.get("required"):
+        kwargs["required"] = list(req)
+    if items := src.get("items"):
+        kwargs["items"] = _schema_to_genai(items)
+    return _gt.Schema(**kwargs)
+
+
+def run_turn_gemini(model_name: str, api_key: str, messages: list[dict]) -> str:
+    from google import genai as _gg
+    from google.genai import types as _gt
+    system_parts = [m["content"] for m in messages if m["role"] == "system" and m.get("content")]
+    system_instruction = "\n".join(system_parts) or None
+    tool = _gt.Tool(
+        function_declarations=[
+            _gt.FunctionDeclaration(
+                name=t["function"]["name"],
+                description=t["function"]["description"],
+                parameters=_schema_to_genai(t["function"].get("parameters", {})),
+            )
+            for t in TOOLS
+        ]
+    )
+    contents = [
+        _gt.Content(
+            role="model" if m["role"] == "assistant" else "user",
+            parts=[_gt.Part.from_text(text=m.get("content") or "")],
+        )
+        for m in messages if m["role"] != "system"
+    ]
+    gemini = _gg.Client(api_key=api_key)
+    config = _gt.GenerateContentConfig(
+        system_instruction=system_instruction, tools=[tool], temperature=0.2
+    )
+    while True:
+        response = gemini.models.generate_content(
+            model=model_name, contents=contents, config=config
+        )
+        candidate = response.candidates[0]
+        parts = candidate.content.parts
+        fn_calls = [p.function_call for p in parts if p.function_call and p.function_call.name]
+        if not fn_calls:
+            return "".join(p.text for p in parts if p.text).strip()
+        contents.append(candidate.content)
+        fn_parts = []
+        for fc in fn_calls:
+            args_json = json.dumps(dict(fc.args))
+            output = dispatch_tool(fc.name, args_json)
+            print(f"  → tool: {fc.name}({args_json[:80]})")
+            fn_parts.append(_gt.Part.from_function_response(
+                name=fc.name, response={"result": output}
+            ))
+        contents.append(_gt.Content(role="user", parts=fn_parts))
+
+
 def run_turn(client: Groq, model: str, messages: list[dict]) -> str:
     while True:
         response = client.chat.completions.create(
@@ -74,16 +150,27 @@ def run_turn(client: Groq, model: str, messages: list[dict]) -> str:
 def main() -> None:
     load_dotenv()
 
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        print("Definí GROQ_API_KEY (copiá .env.example a .env).", file=sys.stderr)
-        sys.exit(1)
+    provider = os.environ.get("LLM_PROVIDER", "groq").strip().lower()
 
-    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-    client = Groq(api_key=api_key)
+    if provider == "gemini":
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            print("Definí GEMINI_API_KEY en .env.", file=sys.stderr)
+            sys.exit(1)
+        model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        client: Groq | None = None
+        label = f"Gemini ({model})"
+    else:
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            print("Definí GROQ_API_KEY (copiá .env.example a .env).", file=sys.stderr)
+            sys.exit(1)
+        model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        client = Groq(api_key=api_key)
+        label = f"Groq ({model})"
 
     print(
-        f"ERP bot (Groq). Datos: {data_backend_label()}.\n"
+        f"ERP bot ({label}). Datos: {data_backend_label()}.\n"
         "Escribí tu pregunta; vacío o 'salir' para terminar.\n"
     )
 
@@ -100,7 +187,10 @@ def main() -> None:
 
         history.append({"role": "user", "content": line})
         try:
-            reply = run_turn(client, model, list(history))
+            if provider == "gemini":
+                reply = run_turn_gemini(model, api_key, list(history))
+            else:
+                reply = run_turn(client, model, list(history))
         except Exception as e:
             print(f"[error] {e}", file=sys.stderr)
             history.pop()

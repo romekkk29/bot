@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import date
@@ -20,17 +21,26 @@ from tools import TOOLS, data_backend_label, dispatch_tool
 load_dotenv()
 
 # Configuración
+LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").strip().lower()
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY")
 WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "https://api.kapso.ai/meta/whatsapp/v24.0")
 
-if not GROQ_API_KEY:
-    print("ERROR: Definí GROQ_API_KEY en .env", file=sys.stderr)
-    sys.exit(1)
-
-# Inicializar cliente Groq
-client = Groq(api_key=GROQ_API_KEY)
+if LLM_PROVIDER == "gemini":
+    if not GEMINI_API_KEY:
+        print("ERROR: Definí GEMINI_API_KEY en .env", file=sys.stderr)
+        sys.exit(1)
+    client: Any = None
+    print(f"[LLM] Usando Gemini ({GEMINI_MODEL})", file=sys.stderr)
+else:
+    if not GROQ_API_KEY:
+        print("ERROR: Definí GROQ_API_KEY en .env", file=sys.stderr)
+        sys.exit(1)
+    client = Groq(api_key=GROQ_API_KEY)
+    print(f"[LLM] Usando Groq ({GROQ_MODEL})", file=sys.stderr)
 
 # Inicializar FastAPI
 app = FastAPI(title="ERP WhatsApp Bot")
@@ -110,7 +120,100 @@ def _assistant_message_to_dict(msg) -> dict:
     return d
 
 
+def _schema_to_genai(schema: dict) -> Any:
+    """Convert JSON Schema dict to google.genai types.Schema."""
+    from google.genai import types as _gt
+    TYPE_MAP = {
+        "string": _gt.Type.STRING, "integer": _gt.Type.INTEGER,
+        "number": _gt.Type.NUMBER, "boolean": _gt.Type.BOOLEAN,
+        "array": _gt.Type.ARRAY, "object": _gt.Type.OBJECT,
+    }
+    src = dict(schema)
+    if "anyOf" in src and "type" not in src:
+        for opt in src["anyOf"]:
+            if isinstance(opt, dict) and opt.get("type") not in (None, "null"):
+                src = {k: v for k, v in src.items() if k != "anyOf"}
+                src.update(opt)
+                break
+    t = str(src.get("type", "object")).lower()
+    kwargs: dict[str, Any] = {"type": TYPE_MAP.get(t, _gt.Type.STRING)}
+    if d := src.get("description"):
+        kwargs["description"] = d
+    if props := src.get("properties"):
+        kwargs["properties"] = {k: _schema_to_genai(v) for k, v in props.items()}
+    if req := src.get("required"):
+        kwargs["required"] = list(req)
+    if items := src.get("items"):
+        kwargs["items"] = _schema_to_genai(items)
+    return _gt.Schema(**kwargs)
+
+
+def _build_genai_tool() -> Any:
+    from google.genai import types as _gt
+    return _gt.Tool(
+        function_declarations=[
+            _gt.FunctionDeclaration(
+                name=t["function"]["name"],
+                description=t["function"]["description"],
+                parameters=_schema_to_genai(t["function"].get("parameters", {})),
+            )
+            for t in TOOLS
+        ]
+    )
+
+
+def _run_turn_gemini(messages: list[dict]) -> str:
+    """Run one conversational turn using the google-genai SDK."""
+    from google import genai as _gg
+    from google.genai import types as _gt
+
+    system_parts = [m["content"] for m in messages if m["role"] == "system" and m.get("content")]
+    system_instruction = "\n".join(system_parts) or None
+
+    contents = [
+        _gt.Content(
+            role="model" if m["role"] == "assistant" else "user",
+            parts=[_gt.Part.from_text(text=m.get("content") or "")],
+        )
+        for m in messages if m["role"] != "system"
+    ]
+
+    gemini = _gg.Client(api_key=GEMINI_API_KEY)
+    config = _gt.GenerateContentConfig(
+        system_instruction=system_instruction,
+        tools=[_build_genai_tool()],
+        temperature=0.2,
+    )
+
+    while True:
+        response = gemini.models.generate_content(
+            model=GEMINI_MODEL, contents=contents, config=config
+        )
+        candidate = response.candidates[0]
+        parts = candidate.content.parts
+        fn_calls = [p.function_call for p in parts if p.function_call and p.function_call.name]
+
+        if not fn_calls:
+            return "".join(p.text for p in parts if p.text).strip()
+
+        contents.append(candidate.content)
+        fn_parts = []
+        for fc in fn_calls:
+            args_json = json.dumps(dict(fc.args))
+            output = dispatch_tool(fc.name, args_json)
+            if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                output = output[:MAX_TOOL_OUTPUT_CHARS] + "...[truncado]"
+            print(f"[GEMINI] tool: {fc.name}({args_json[:80]})", file=sys.stderr)
+            fn_parts.append(_gt.Part.from_function_response(
+                name=fc.name, response={"result": output}
+            ))
+        contents.append(_gt.Content(role="user", parts=fn_parts))
+
+
 def run_turn(messages: list[dict]) -> str:
+    if LLM_PROVIDER == "gemini":
+        return _run_turn_gemini(messages)
+    # Groq (OpenAI-compatible)
     while True:
         response = client.chat.completions.create(
             model=GROQ_MODEL,
