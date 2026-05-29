@@ -111,6 +111,7 @@ def run_turn_gemini(model_name: str, api_key: str, messages: list[dict]) -> str:
             args_json = json.dumps(dict(fc.args))
             output = dispatch_tool(fc.name, args_json)
             print(f"  → tool: {fc.name}({args_json[:80]})")
+            print(f"     ← {output[:300]}")
             fn_parts.append(_gt.Part.from_function_response(
                 name=fc.name, response={"result": output}
             ))

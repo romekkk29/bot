@@ -376,7 +376,17 @@ async def whatsapp_webhook(request: Request):
                     "⚠️ El asistente está temporalmente no disponible por límite de uso. "
                     "Por favor intentá de nuevo en unos minutos."
                 )
-                await send_whatsapp_message(from_number, aviso, phone_number_id)
+            elif "503" in err_str or "UNAVAILABLE" in err_str:
+                aviso = (
+                    "⚠️ El asistente está temporalmente no disponible. "
+                    "Por favor intentá de nuevo en unos instantes."
+                )
+            else:
+                aviso = (
+                    "⚠️ Ocurrió un error inesperado. "
+                    "Por favor intentá de nuevo en unos momentos."
+                )
+            await send_whatsapp_message(from_number, aviso, phone_number_id)
             # Siempre retornar 200 para evitar reintentos de Kapso
             return {"status": "error", "detail": err_str}
 

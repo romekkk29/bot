@@ -785,11 +785,13 @@ def _resolve_products_by_query(query: str, limit: int) -> list[dict[str, Any]]:
     table = _products_table()
     code_c, name_c, _, uuid_c = _product_table_columns()
     select_cols, search_cols = _product_search_columns(code_c, name_c, uuid_c)
+    print(f"[DEBUG] tabla productos: {table!r}  |  uuid_col: {uuid_c!r}  |  code: {code_c!r}  |  name: {name_c!r}", flush=True)
     if not uuid_c:
         raise ValueError("ERP_SUPABASE_PRODUCT_COL_UUID es obligatorio para consultas de stock/cardex")
     tok = _like_token(query)
     pat = f"%{tok}%"
     or_clause = ",".join(f"{col}.ilike.{pat}" for col in search_cols)
+    print(f"[DEBUG] SELECT {select_cols} FROM {table} WHERE {or_clause} LIMIT {limit}", flush=True)
     try:
         r = client.table(table).select(select_cols).or_(or_clause).limit(limit).execute()
         return r.data or []
@@ -1851,6 +1853,7 @@ def _products_from_supabase(query: str, limit: int) -> dict[str, Any]:
     tok = _like_token(query)
     pat = f"%{tok}%"
     or_clause = f"{name_c}.ilike.{pat},{code_c}.ilike.{pat}"
+    print(f"[DEBUG] SELECT {select_cols} FROM {table} WHERE {or_clause} LIMIT {limit}", flush=True)
     q = client.table(table).select(select_cols)
     r = q.or_(or_clause).limit(limit).execute()
     raw_rows: list[dict[str, Any]] = r.data or []
