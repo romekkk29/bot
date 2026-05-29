@@ -14,6 +14,8 @@ from groq import Groq
 
 from tools import TOOLS, data_backend_label, dispatch_tool
 
+MAX_TOOL_OUTPUT_CHARS = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "2000"))
+
 def _build_system_prompt() -> str:
     hoy = date.today().isoformat()
     return f"""Sos el asistente del ERP de la empresa.
@@ -97,9 +99,42 @@ def run_turn_gemini(model_name: str, api_key: str, messages: list[dict]) -> str:
         system_instruction=system_instruction, tools=[tool], temperature=0.2
     )
     while True:
+        # ── DEBUG: prompt completo ──────────────────────────────────────────
+        total_chars = 0
+        print("\n" + "═" * 60, flush=True)
+        if system_instruction:
+            print(f"[SYSTEM] ({len(system_instruction)}c)\n{system_instruction}", flush=True)
+            total_chars += len(system_instruction)
+        for i, c in enumerate(contents):
+            role = getattr(c, "role", "?")
+            for p in (c.parts or []):
+                if hasattr(p, "text") and p.text:
+                    txt = p.text
+                    print(f"[{role.upper()} #{i}] ({len(txt)}c)\n{txt}", flush=True)
+                    total_chars += len(txt)
+                elif hasattr(p, "function_call") and p.function_call:
+                    fc = p.function_call
+                    print(f"[{role.upper()} #{i}] tool_call: {fc.name}({dict(fc.args)})", flush=True)
+                elif hasattr(p, "function_response") and p.function_response:
+                    fr = p.function_response
+                    resp_str = str(fr.response)
+                    total_chars += len(resp_str)
+                    print(f"[{role.upper()} #{i}] tool_result: {fr.name} → {resp_str[:200]}", flush=True)
+        print(f"── TOTAL: {len(contents)} contenidos, ~{total_chars}c (~{total_chars//4} tokens est.) ──", flush=True)
+        print("═" * 60 + "\n", flush=True)
+        # ── FIN DEBUG ───────────────────────────────────────────────────────
         response = gemini.models.generate_content(
             model=model_name, contents=contents, config=config
         )
+        # ── TOKEN USAGE REAL ────────────────────────────────────────────────
+        if hasattr(response, "usage_metadata") and response.usage_metadata:
+            u = response.usage_metadata
+            print(
+                f"[TOKENS] input={u.prompt_token_count}  output={u.candidates_token_count}  "
+                f"total={u.total_token_count}  (de input, tools schemas≈{u.prompt_token_count - total_chars//4} tokens est.)",
+                flush=True,
+            )
+        # ────────────────────────────────────────────────────────────────────
         candidate = response.candidates[0]
         parts = candidate.content.parts
         fn_calls = [p.function_call for p in parts if p.function_call and p.function_call.name]
@@ -110,6 +145,8 @@ def run_turn_gemini(model_name: str, api_key: str, messages: list[dict]) -> str:
         for fc in fn_calls:
             args_json = json.dumps(dict(fc.args))
             output = dispatch_tool(fc.name, args_json)
+            if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                output = output[:MAX_TOOL_OUTPUT_CHARS] + "...[truncado]"
             print(f"  → tool: {fc.name}({args_json[:80]})")
             print(f"     ← {output[:300]}")
             fn_parts.append(_gt.Part.from_function_response(
@@ -127,6 +164,9 @@ def run_turn(client: Groq, model: str, messages: list[dict]) -> str:
             tool_choice="auto",
             temperature=0.2,
         )
+        if response.usage:
+            u = response.usage
+            print(f"[TOKENS] input={u.prompt_tokens}  output={u.completion_tokens}  total={u.total_tokens}", flush=True)
         choice = response.choices[0]
         msg = choice.message
 
@@ -136,6 +176,10 @@ def run_turn(client: Groq, model: str, messages: list[dict]) -> str:
                 name = tc.function.name
                 raw_args = tc.function.arguments or "{}"
                 output = dispatch_tool(name, raw_args)
+                print(f"  → tool: {name}({raw_args[:80]})")
+                print(f"     ← {output[:300]}")
+                if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                    output = output[:MAX_TOOL_OUTPUT_CHARS] + "...[truncado]"
                 messages.append(
                     {
                         "role": "tool",

@@ -1861,8 +1861,6 @@ def _products_from_supabase(query: str, limit: int) -> dict[str, Any]:
     return {
         "query": query,
         "resultados": rows,
-        "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -1906,8 +1904,6 @@ def _product_available_stock_from_supabase(query: str, limit: int) -> dict[str, 
         return {
             "query": query,
             "resultados": [],
-            "cantidad_devuelta": 0,
-            "fuente": "supabase",
             "nota": "sin coincidencias de producto",
         }
     code_c, name_c, _, uuid_c = _product_table_columns()
@@ -1960,23 +1956,19 @@ def _product_available_stock_from_supabase(query: str, limit: int) -> dict[str, 
 
         out.append(
             {
-                "product_id": pid,
-                "sku_o_codigo": product.get(code_c),
+                "sku": product.get(code_c),
                 "nombre": product.get(name_c),
                 "stock_total": stock_total,
                 "stock_reservado": reserved_total,
                 "stock_disponible": stock_total - reserved_total,
-                "min_stock_total": min_total,
-                "stock_projected_total": projected_total,
-                "depositos": depots,
+                "min_stock": min_total,
+                "stock_proyectado": projected_total,
+                "depositos": [{k: v for k, v in d.items() if k != "warehouse_id" or len(depots) > 1} for d in depots],
             }
         )
     return {
         "query": query,
         "resultados": out,
-        "cantidad_devuelta": len(out),
-        "fuente": "supabase",
-        "tabla_stock": ws_table,
     }
 
 
@@ -2096,8 +2088,6 @@ def _recent_product_movements_from_supabase(query: str, days: int, limit: int) -
             "query": query,
             "dias": days,
             "movimientos": [],
-            "cantidad_devuelta": 0,
-            "fuente": "supabase",
             "nota": "sin coincidencias de producto",
         }
 
@@ -2118,26 +2108,27 @@ def _recent_product_movements_from_supabase(query: str, days: int, limit: int) -
     for row in rows:
         pid = row.get(product_c)
         p = product_map.get(pid, {})
-        out.append(
-            {
-                "product_id": pid,
-                "sku_o_codigo": p.get(code_c),
-                "nombre": p.get(name_c),
-                "fecha_hora": row.get(date_c),
-                "tipo_movimiento": row.get(movement_c),
-                "cantidad_entrada": _to_float(row.get(in_c)),
-                "cantidad_salida": _to_float(row.get(out_c)),
-                "sku_cardex": row.get(sku_c),
-                "descripcion_cardex": row.get(desc_c),
-            }
-        )
+        sku_prod = p.get(code_c)
+        nombre_prod = p.get(name_c)
+        sku_cx = row.get(sku_c)
+        desc_cx = row.get(desc_c)
+        entry: dict[str, Any] = {
+            "sku": sku_prod or sku_cx,
+            "nombre": nombre_prod or desc_cx,
+            "fecha": row.get(date_c),
+            "tipo": row.get(movement_c),
+            "entrada": _to_float(row.get(in_c)),
+            "salida": _to_float(row.get(out_c)),
+        }
+        if sku_cx and sku_cx != sku_prod:
+            entry["sku_cardex"] = sku_cx
+        if desc_cx and desc_cx != nombre_prod:
+            entry["desc_cardex"] = desc_cx
+        out.append(entry)
     return {
         "query": query,
         "dias": days,
         "movimientos": out,
-        "cantidad_devuelta": len(out),
-        "fuente": "supabase",
-        "tabla_cardex": table,
     }
 
 
@@ -2293,7 +2284,7 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
             else:
                 result = _stub_products_below_min_stock(lim)
         elif name == "list_recent_product_movements":
-            lim = _coerce_limit(args.get("limit"), default=100, cap=300)
+            lim = _coerce_limit(args.get("limit"), default=20, cap=100)
             days = _coerce_limit(args.get("days"), default=7, cap=90)
             if use_sb:
                 result = _recent_product_movements_from_supabase(str(args["query"]), days, lim)
