@@ -26,6 +26,8 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY")
 WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "https://api.kapso.ai/meta/whatsapp/v24.0")
 
@@ -35,6 +37,9 @@ if LLM_PROVIDER == "gemini":
         sys.exit(1)
     client: Any = None
     print(f"[LLM] Usando Gemini ({GEMINI_MODEL})", file=sys.stderr)
+elif LLM_PROVIDER == "ollama":
+    client = None
+    print(f"[LLM] Usando Ollama local ({OLLAMA_MODEL}) → {OLLAMA_BASE_URL}", file=sys.stderr)
 else:
     if not GROQ_API_KEY:
         print("ERROR: Definí GROQ_API_KEY en .env", file=sys.stderr)
@@ -162,6 +167,47 @@ def _build_genai_tool() -> Any:
     )
 
 
+def _run_turn_ollama(messages: list[dict]) -> str:
+    """Run one conversational turn using Ollama's OpenAI-compatible API."""
+    from openai import OpenAI as _OAI
+    ollama_client = _OAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+
+    # Qwen3 tiene modo thinking activado por defecto; lo deshabilitamos para mayor velocidad
+    if "qwen3" in OLLAMA_MODEL.lower():
+        msgs = [
+            {**m, "content": "/no_think\n" + (m.get("content") or "")}
+            if m["role"] == "system" else m
+            for m in messages
+        ]
+    else:
+        msgs = messages
+
+    while True:
+        response = ollama_client.chat.completions.create(
+            model=OLLAMA_MODEL,
+            messages=msgs,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.2,
+        )
+        choice = response.choices[0]
+        msg = choice.message
+
+        if msg.tool_calls:
+            msgs.append(_assistant_message_to_dict(msg))
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                raw_args = tc.function.arguments or "{}"
+                output = dispatch_tool(name, raw_args)
+                if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                    output = output[:MAX_TOOL_OUTPUT_CHARS] + "...[truncado]"
+                print(f"[OLLAMA] tool: {name}({raw_args[:80]})", file=sys.stderr)
+                msgs.append({"role": "tool", "tool_call_id": tc.id, "content": output})
+            continue
+
+        return (msg.content or "").strip()
+
+
 def _run_turn_gemini(messages: list[dict]) -> str:
     """Run one conversational turn using the google-genai SDK."""
     from google import genai as _gg
@@ -213,6 +259,8 @@ def _run_turn_gemini(messages: list[dict]) -> str:
 def run_turn(messages: list[dict]) -> str:
     if LLM_PROVIDER == "gemini":
         return _run_turn_gemini(messages)
+    if LLM_PROVIDER == "ollama":
+        return _run_turn_ollama(messages)
     # Groq (OpenAI-compatible)
     while True:
         response = client.chat.completions.create(
@@ -287,10 +335,17 @@ async def send_whatsapp_message(to_number: str, message: str, phone_number_id: s
 @app.get("/")
 async def root():
     """Endpoint de health check."""
+    if LLM_PROVIDER == "gemini":
+        model_label = GEMINI_MODEL
+    elif LLM_PROVIDER == "ollama":
+        model_label = OLLAMA_MODEL
+    else:
+        model_label = GROQ_MODEL
     return {
         "status": "ok",
         "backend": data_backend_label(),
-        "model": GROQ_MODEL,
+        "provider": LLM_PROVIDER,
+        "model": model_label,
     }
 
 
@@ -445,7 +500,7 @@ async def clear_history(phone_number: str):
 if __name__ == "__main__":
     import uvicorn
     
-    print(f"Iniciando ERP WhatsApp Bot (Groq: {GROQ_MODEL})")
+    print(f"Iniciando ERP WhatsApp Bot (provider={LLM_PROVIDER})")
     print(f"Backend de datos: {data_backend_label()}")
     print(f"Servidor en http://0.0.0.0:8000")
     
