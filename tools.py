@@ -56,9 +56,10 @@ TOOLS: list[dict[str, Any]] = [
             "name": "list_sales_orders",
             "description": (
                 "Lista órdenes de venta (número, fecha, total, estado, etc.) en un rango de fechas. "
-                "SOLO llamar si el usuario especificó un período concreto (hoy, esta semana, este mes, rango de fechas). "
+                "Acepta filtro opcional por cliente (nombre o UUID). "
+                "Si el usuario menciona un cliente específico, pasar customer_name. "
                 "Si pide 'todas las ventas' o 'todo el detalle' sin filtro temporal, NO llamar: pedirle al usuario que acoter el período. "
-                "Usar cuando pregunten qué órdenes hay, pedidos de venta, OV, listado de ventas."
+                "Usar cuando pregunten qué órdenes hay, pedidos de venta, OV, listado de ventas, ventas de un cliente."
             ),
             "parameters": {
                 "type": "object",
@@ -70,6 +71,14 @@ TOOLS: list[dict[str, Any]] = [
                     "hasta": {
                         "type": "string",
                         "description": "Fecha fin inclusive YYYY-MM-DD (opcional; default hoy)",
+                    },
+                    "customer_name": {
+                        "type": "string",
+                        "description": "Nombre o razón social del cliente para filtrar (opcional)",
+                    },
+                    "customer_id": {
+                        "type": "string",
+                        "description": "UUID del cliente para filtrar (opcional; alternativa a customer_name)",
                     },
                     "limit": {
                         "anyOf": [
@@ -415,6 +424,40 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_sales_order_items",
+            "description": (
+                "Lista los ítems/líneas de una orden de venta específica. "
+                "Usar cuando pregunten qué productos compró un cliente en una venta, "
+                "detalle de líneas, productos de una OV. "
+                "Requiere el id (UUID) de la orden de venta obtenido de list_sales_orders, "
+                "o el número de orden (ej: OV-2026-003400)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sales_order_id": {
+                        "type": "string",
+                        "description": "UUID de la orden de venta (sales_orders.id)",
+                    },
+                    "order_number": {
+                        "type": "string",
+                        "description": "Número de orden de venta (ej: OV-2026-003400). Alternativa al UUID.",
+                    },
+                    "limit": {
+                        "anyOf": [
+                            {"type": "integer"},
+                            {"type": "string"},
+                        ],
+                        "description": "Máximo de líneas (default 100, máx 500)",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -1112,6 +1155,80 @@ _UUID_RE = re.compile(
 )
 
 
+def _sales_order_items_select_expr() -> str:
+    default = "id,sales_order_id,product_id,quantity,unit_price,line_total,product_name,sku"
+    s = (os.environ.get("ERP_SUPABASE_SALES_ORDER_ITEMS_SELECT") or default).strip() or default
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        if not _safe_sql_identifier(p):
+            raise ValueError(f"ERP_SUPABASE_SALES_ORDER_ITEMS_SELECT: columna inválida {p!r}")
+    return ",".join(parts)
+
+
+def _sales_order_number_column() -> str:
+    c = (os.environ.get("ERP_SUPABASE_ORDERS_NUMBER_COL") or "order_number").strip() or "order_number"
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_ORDERS_NUMBER_COL inválida: {c!r}")
+    return c
+
+
+def _resolve_sales_order_id_by_number(order_number: str) -> str | None:
+    client = _get_supabase()
+    assert client is not None
+    table = _orders_list_table()
+    number_c = _sales_order_number_column()
+    r = client.table(table).select("id").eq(number_c, order_number.strip()).limit(1).execute()
+    rows = r.data or []
+    return str(rows[0]["id"]) if rows and rows[0].get("id") else None
+
+
+def _stub_list_sales_order_items(sales_order_id: str, limit: int) -> dict[str, Any]:
+    demo = [
+        {
+            "id": "demo-item-001",
+            "sales_order_id": sales_order_id,
+            "product_id": "demo-prod-1",
+            "sku": "SKU-001",
+            "product_name": "Producto demo A",
+            "quantity": 3.0,
+            "unit_price": 500.0,
+            "line_total": 1500.0,
+        }
+    ]
+    return {
+        "sales_order_id": sales_order_id,
+        "lineas": demo[:limit],
+        "cantidad_devuelta": min(len(demo), limit),
+        "limite": limit,
+        "fuente": "stub",
+        "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para leer Postgres",
+    }
+
+
+def _list_sales_order_items_from_supabase(sales_order_id: str, limit: int) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    items_t, _, fk_c, *_ = _sales_items_column_config()
+    select_cols = _sales_order_items_select_expr()
+    lim = max(1, min(limit, 500))
+    r = (
+        client.table(items_t)
+        .select(select_cols)
+        .eq(fk_c, sales_order_id.strip())
+        .limit(lim)
+        .execute()
+    )
+    rows: list[dict[str, Any]] = r.data or []
+    return {
+        "sales_order_id": sales_order_id.strip(),
+        "lineas": rows,
+        "cantidad_devuelta": len(rows),
+        "limite": lim,
+        "fuente": "supabase",
+        "tabla": items_t,
+    }
+
+
 def _is_uuid(s: str) -> bool:
     return bool(_UUID_RE.fullmatch(s.strip()))
 
@@ -1137,7 +1254,19 @@ def _stub_list_sales_orders(desde: str, hasta: str, limit: int) -> dict[str, Any
     }
 
 
-def _list_sales_orders_from_supabase(desde: str, hasta: str, limit: int) -> dict[str, Any]:
+def _resolve_customer_id_by_name(name: str) -> str | None:
+    client = _get_supabase()
+    assert client is not None
+    table, id_c, name_c, *_ = _customer_column_config()
+    tok = _like_token(name)
+    r = client.table(table).select(id_c).filter(name_c, "ilike", f"%{tok}%").limit(1).execute()
+    rows = r.data or []
+    return str(rows[0][id_c]) if rows and rows[0].get(id_c) else None
+
+
+def _list_sales_orders_from_supabase(
+    desde: str, hasta: str, limit: int, filter_customer_id: str | None = None
+) -> dict[str, Any]:
     client = _get_supabase()
     assert client is not None
     table = _orders_list_table()
@@ -1149,15 +1278,15 @@ def _list_sales_orders_from_supabase(desde: str, hasta: str, limit: int) -> dict
         select_parts.append(customer_id_col)
     select_cols = ",".join(select_parts)
     lim = max(1, min(limit, 200))
-    r = (
+    q = (
         client.table(table)
         .select(select_cols)
         .gte(date_c, desde)
         .lte(date_c, hasta)
-        .order(date_c, desc=True)
-        .limit(lim)
-        .execute()
     )
+    if filter_customer_id:
+        q = q.eq(customer_id_col, filter_customer_id)
+    r = q.order(date_c, desc=True).limit(lim).execute()
     rows: list[dict[str, Any]] = r.data or []
     if _orders_include_customer_data():
         rows = _attach_customers_to_orders(rows, customer_id_col)
@@ -2192,8 +2321,17 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 )
             except ValueError as e:
                 return json.dumps({"error": str(e)}, ensure_ascii=False)
+            filter_cid: str | None = None
             if use_sb:
-                result = _list_sales_orders_from_supabase(desde, hasta, lim)
+                cid_raw = str(args.get("customer_id") or "").strip()
+                cname_raw = str(args.get("customer_name") or "").strip()
+                if cid_raw:
+                    filter_cid = cid_raw
+                elif cname_raw:
+                    filter_cid = _resolve_customer_id_by_name(cname_raw)
+                    if not filter_cid:
+                        return json.dumps({"error": f"No se encontró cliente: {cname_raw!r}"}, ensure_ascii=False)
+                result = _list_sales_orders_from_supabase(desde, hasta, lim, filter_cid)
             else:
                 result = _stub_list_sales_orders(desde, hasta, lim)
         elif name == "count_sales_orders_by_status":
@@ -2290,6 +2428,26 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _recent_product_movements_from_supabase(str(args["query"]), days, lim)
             else:
                 result = _stub_recent_product_movements(str(args["query"]), days, lim)
+        elif name == "list_sales_order_items":
+            lim = _coerce_limit(args.get("limit"), default=100, cap=500)
+            oid = str(args.get("sales_order_id") or "").strip()
+            order_num = str(args.get("order_number") or "").strip()
+            if not oid and not order_num:
+                return json.dumps({"error": "Requerido: sales_order_id (UUID) u order_number"}, ensure_ascii=False)
+            if not oid or not _is_uuid(oid):
+                if use_sb and order_num:
+                    resolved = _resolve_sales_order_id_by_number(order_num)
+                    if not resolved:
+                        return json.dumps({"error": f"No se encontró la orden {order_num!r}"}, ensure_ascii=False)
+                    oid = resolved
+                elif not use_sb:
+                    oid = oid or order_num
+                else:
+                    return json.dumps({"error": "sales_order_id debe ser un UUID válido, o proveer order_number"}, ensure_ascii=False)
+            if use_sb:
+                result = _list_sales_order_items_from_supabase(oid, lim)
+            else:
+                result = _stub_list_sales_order_items(oid, lim)
         else:
             return json.dumps({"error": f"tool desconocida: {name}"})
         return json.dumps(result, ensure_ascii=False)

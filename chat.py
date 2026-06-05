@@ -81,7 +81,7 @@ def _schema_to_genai(schema: dict) -> Any:
     return _gt.Schema(**kwargs)
 
 
-def run_turn_gemini(model_name: str, api_key: str, messages: list[dict]) -> str:
+def run_turn_gemini(model_name: str, api_key: str, messages: list[dict], tools: list = TOOLS) -> str:
     from google import genai as _gg
     from google.genai import types as _gt
 
@@ -94,9 +94,9 @@ def run_turn_gemini(model_name: str, api_key: str, messages: list[dict]) -> str:
                 description=t["function"]["description"],
                 parameters=_schema_to_genai(t["function"].get("parameters", {})),
             )
-            for t in TOOLS
+            for t in tools
         ]
-    )
+    ) if tools else None
     contents = [
         _gt.Content(
             role="model" if m["role"] == "assistant" else "user",
@@ -106,7 +106,9 @@ def run_turn_gemini(model_name: str, api_key: str, messages: list[dict]) -> str:
     ]
     gemini = _gg.Client(api_key=api_key)
     config = _gt.GenerateContentConfig(
-        system_instruction=system_instruction, tools=[tool], temperature=0.2
+        system_instruction=system_instruction,
+        tools=[tool] if tool else None,
+        temperature=0.2,
     )
     while True:
         # ── DEBUG: prompt completo ──────────────────────────────────────────
@@ -165,7 +167,7 @@ def run_turn_gemini(model_name: str, api_key: str, messages: list[dict]) -> str:
         contents.append(_gt.Content(role="user", parts=fn_parts))
 
 
-def run_turn_ollama(base_url: str, model: str, messages: list[dict]) -> str:
+def run_turn_ollama(base_url: str, model: str, messages: list[dict], tools: list = TOOLS) -> str:
     from openai import OpenAI as _OAI
 
     ollama_client = _OAI(base_url=base_url, api_key="ollama")
@@ -179,13 +181,11 @@ def run_turn_ollama(base_url: str, model: str, messages: list[dict]) -> str:
         msgs = messages
 
     while True:
-        response = ollama_client.chat.completions.create(
-            model=model,
-            messages=msgs,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.2,
-        )
+        kw: dict = {"model": model, "messages": msgs, "temperature": 0.2}
+        if tools:
+            kw["tools"] = tools
+            kw["tool_choice"] = "auto"
+        response = ollama_client.chat.completions.create(**kw)
         choice = response.choices[0]
         msg = choice.message
 
@@ -205,15 +205,13 @@ def run_turn_ollama(base_url: str, model: str, messages: list[dict]) -> str:
         return (msg.content or "").strip()
 
 
-def run_turn(client: Groq, model: str, messages: list[dict]) -> str:
+def run_turn(client: Groq, model: str, messages: list[dict], tools: list = TOOLS) -> str:
     while True:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            temperature=0.2,
-        )
+        kw: dict = {"model": model, "messages": messages, "temperature": 0.2}
+        if tools:
+            kw["tools"] = tools
+            kw["tool_choice"] = "auto"
+        response = client.chat.completions.create(**kw)
         choice = response.choices[0]
         msg = choice.message
 
@@ -259,9 +257,14 @@ def main() -> None:
         if not api_key:
             print("Definí GROQ_API_KEY (copiá .env.example a .env).", file=sys.stderr)
             sys.exit(1)
-        model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+        model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
         client = Groq(api_key=api_key)
         label = f"Groq ({model})"
+
+    no_tools = "--no-tools" in sys.argv
+    active_tools = [] if no_tools else TOOLS
+    if no_tools:
+        print("[modo] Sin tools activas.", file=sys.stderr)
 
     print(
         f"ERP bot ({label}). Datos: {data_backend_label()}.\n"
@@ -282,11 +285,11 @@ def main() -> None:
         history.append({"role": "user", "content": line})
         try:
             if provider == "gemini":
-                reply = run_turn_gemini(model, api_key, list(history))
+                reply = run_turn_gemini(model, api_key, list(history), active_tools)
             elif provider == "ollama":
-                reply = run_turn_ollama(base_url, model, list(history))
+                reply = run_turn_ollama(base_url, model, list(history), active_tools)
             else:
-                reply = run_turn(client, model, list(history))
+                reply = run_turn(client, model, list(history), active_tools)
         except Exception as e:
             print(f"[error] {e}", file=sys.stderr)
             history.pop()
