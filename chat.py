@@ -15,6 +15,37 @@ from groq import Groq
 from tools import TOOLS, data_backend_label, dispatch_tool
 
 MAX_TOOL_OUTPUT_CHARS = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "2000"))
+MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "6000"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "1000"))
+_TOOLS_SCHEMA_TOKENS = 2500
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def _trim_history(messages: list[dict], max_input: int = MAX_INPUT_TOKENS) -> list[dict]:
+    """Recorta mensajes antiguos para no superar el presupuesto de tokens de input."""
+    budget = max_input - _TOOLS_SCHEMA_TOKENS
+    system_msgs = [m for m in messages if m["role"] == "system"]
+    non_system = [m for m in messages if m["role"] != "system"]
+    if not non_system:
+        return messages
+    used = sum(_estimate_tokens(m.get("content") or "") for m in system_msgs)
+    last = non_system[-1:]
+    rest = non_system[:-1]
+    used += _estimate_tokens(last[0].get("content") or "")
+    kept: list[dict] = []
+    for m in reversed(rest):
+        tok = _estimate_tokens(m.get("content") or "")
+        if used + tok > budget:
+            break
+        kept.insert(0, m)
+        used += tok
+    if len(kept) < len(rest):
+        dropped = len(rest) - len(kept)
+        print(f"[trim] {dropped} mensaje(s) antiguo(s) descartado(s) (~{used} tokens est.)", file=sys.stderr)
+    return system_msgs + kept + last
 
 
 def _build_system_prompt() -> str:
@@ -109,48 +140,22 @@ def run_turn_gemini(model_name: str, api_key: str, messages: list[dict], tools: 
         system_instruction=system_instruction,
         tools=[tool] if tool else None,
         temperature=0.2,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
     )
+    total_in = total_out = 0
     while True:
-        # ── DEBUG: prompt completo ──────────────────────────────────────────
-        total_chars = 0
-        print("\n" + "═" * 60, flush=True)
-        if system_instruction:
-            print(f"[SYSTEM] ({len(system_instruction)}c)\n{system_instruction}", flush=True)
-            total_chars += len(system_instruction)
-        for i, c in enumerate(contents):
-            role = getattr(c, "role", "?")
-            for p in (c.parts or []):
-                if hasattr(p, "text") and p.text:
-                    txt = p.text
-                    print(f"[{role.upper()} #{i}] ({len(txt)}c)\n{txt}", flush=True)
-                    total_chars += len(txt)
-                elif hasattr(p, "function_call") and p.function_call:
-                    fc = p.function_call
-                    print(f"[{role.upper()} #{i}] tool_call: {fc.name}({dict(fc.args)})", flush=True)
-                elif hasattr(p, "function_response") and p.function_response:
-                    fr = p.function_response
-                    resp_str = str(fr.response)
-                    total_chars += len(resp_str)
-                    print(f"[{role.upper()} #{i}] tool_result: {fr.name} → {resp_str[:200]}", flush=True)
-        print(f"── TOTAL: {len(contents)} contenidos, ~{total_chars}c (~{total_chars//4} tokens est.) ──", flush=True)
-        print("═" * 60 + "\n", flush=True)
-        # ── FIN DEBUG ───────────────────────────────────────────────────────
         response = gemini.models.generate_content(
             model=model_name, contents=contents, config=config
         )
-        # ── TOKEN USAGE REAL ────────────────────────────────────────────────
         if hasattr(response, "usage_metadata") and response.usage_metadata:
             u = response.usage_metadata
-            print(
-                f"[TOKENS] input={u.prompt_token_count}  output={u.candidates_token_count}  "
-                f"total={u.total_token_count}  (de input, tools schemas≈{u.prompt_token_count - total_chars//4} tokens est.)",
-                flush=True,
-            )
-        # ────────────────────────────────────────────────────────────────────
+            total_in += u.prompt_token_count or 0
+            total_out += u.candidates_token_count or 0
         candidate = response.candidates[0]
         parts = candidate.content.parts
         fn_calls = [p.function_call for p in parts if p.function_call and p.function_call.name]
         if not fn_calls:
+            print(f"[tokens] input: {total_in:,} | output: {total_out:,} | total: {total_in + total_out:,}")
             return "".join(p.text for p in parts if p.text).strip()
         contents.append(candidate.content)
         fn_parts = []
@@ -180,12 +185,17 @@ def run_turn_ollama(base_url: str, model: str, messages: list[dict], tools: list
     else:
         msgs = messages
 
+    msgs = _trim_history(msgs)
+    total_in = total_out = 0
     while True:
-        kw: dict = {"model": model, "messages": msgs, "temperature": 0.2}
+        kw: dict = {"model": model, "messages": msgs, "temperature": 0.2, "max_tokens": MAX_OUTPUT_TOKENS}
         if tools:
             kw["tools"] = tools
             kw["tool_choice"] = "auto"
         response = ollama_client.chat.completions.create(**kw)
+        if response.usage:
+            total_in += response.usage.prompt_tokens or 0
+            total_out += response.usage.completion_tokens or 0
         choice = response.choices[0]
         msg = choice.message
 
@@ -202,16 +212,22 @@ def run_turn_ollama(base_url: str, model: str, messages: list[dict], tools: list
                 msgs.append({"role": "tool", "tool_call_id": tc.id, "content": output})
             continue
 
+        print(f"[tokens] input: {total_in:,} | output: {total_out:,} | total: {total_in + total_out:,}")
         return (msg.content or "").strip()
 
 
 def run_turn(client: Groq, model: str, messages: list[dict], tools: list = TOOLS) -> str:
+    messages = _trim_history(messages)
+    total_in = total_out = 0
     while True:
-        kw: dict = {"model": model, "messages": messages, "temperature": 0.2}
+        kw: dict = {"model": model, "messages": messages, "temperature": 0.2, "max_tokens": MAX_OUTPUT_TOKENS}
         if tools:
             kw["tools"] = tools
             kw["tool_choice"] = "auto"
         response = client.chat.completions.create(**kw)
+        if response.usage:
+            total_in += response.usage.prompt_tokens or 0
+            total_out += response.usage.completion_tokens or 0
         choice = response.choices[0]
         msg = choice.message
 
@@ -230,6 +246,7 @@ def run_turn(client: Groq, model: str, messages: list[dict], tools: list = TOOLS
                 )
             continue
 
+        print(f"[tokens] input: {total_in:,} | output: {total_out:,} | total: {total_in + total_out:,}")
         return (msg.content or "").strip()
 
 
