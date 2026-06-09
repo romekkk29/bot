@@ -461,6 +461,153 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_customer_invoices",
+            "description": (
+                "Lista facturas de clientes (número, fecha, total, cobrado, saldo, estado) en un rango de fechas. "
+                "Acepta filtro opcional por cliente (nombre o UUID) y/o estado. "
+                "Usar cuando pregunten por facturas, comprobantes emitidos, deuda de un cliente, facturas pendientes/vencidas."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio inclusive YYYY-MM-DD (issue_date)",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin inclusive YYYY-MM-DD (default hoy)",
+                    },
+                    "customer_name": {
+                        "type": "string",
+                        "description": "Nombre o razón social del cliente (opcional)",
+                    },
+                    "customer_id": {
+                        "type": "string",
+                        "description": "UUID del cliente (opcional; alternativa a customer_name)",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Filtrar por estado: pending, paid, partial, overdue, cancelled, voided (opcional)",
+                    },
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Máximo de facturas a devolver (default 30, máx 200)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_invoice_summary",
+            "description": (
+                "Resumen agregado de facturación en un rango de fechas: total facturado, total cobrado, saldo pendiente, "
+                "cantidad de facturas y desglose por estado. "
+                "Acepta filtro opcional por cliente. "
+                "Usar cuando pregunten cuánto facturamos, cuánto cobró un cliente, saldo total de deuda."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio inclusive YYYY-MM-DD",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin inclusive YYYY-MM-DD",
+                    },
+                    "customer_name": {
+                        "type": "string",
+                        "description": "Nombre o razón social del cliente (opcional)",
+                    },
+                    "customer_id": {
+                        "type": "string",
+                        "description": "UUID del cliente (opcional)",
+                    },
+                },
+                "required": ["desde", "hasta"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_customer_invoice_items",
+            "description": (
+                "Lista los ítems/líneas de una factura de cliente específica. "
+                "Usar cuando pregunten qué productos tiene una factura, detalle de una FC, líneas de comprobante."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": {
+                        "type": "string",
+                        "description": "UUID de la factura (customer_invoices.id)",
+                    },
+                    "invoice_number": {
+                        "type": "string",
+                        "description": "Número de factura (ej: FC-0001-00000123). Alternativa al UUID.",
+                    },
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Máximo de líneas (default 100, máx 500)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_customer_payments",
+            "description": (
+                "Lista pagos registrados para una factura o cliente. "
+                "Usar cuando pregunten por cobros, pagos recibidos, método de pago, historial de pagos de una factura."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": {
+                        "type": "string",
+                        "description": "UUID de la factura para filtrar pagos (opcional)",
+                    },
+                    "invoice_number": {
+                        "type": "string",
+                        "description": "Número de factura para filtrar pagos (opcional)",
+                    },
+                    "customer_name": {
+                        "type": "string",
+                        "description": "Nombre del cliente para ver todos sus pagos (opcional)",
+                    },
+                    "customer_id": {
+                        "type": "string",
+                        "description": "UUID del cliente (opcional)",
+                    },
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio inclusive YYYY-MM-DD (payment_date)",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin inclusive YYYY-MM-DD",
+                    },
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Máximo de pagos (default 50, máx 200)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 _supabase_client: Any | None = None
@@ -1231,6 +1378,295 @@ def _list_sales_order_items_from_supabase(sales_order_id: str, limit: int) -> di
 
 def _is_uuid(s: str) -> bool:
     return bool(_UUID_RE.fullmatch(s.strip()))
+
+
+# ── Facturas: config ────────────────────────────────────────────────────────
+
+def _invoices_table() -> str:
+    t = (os.environ.get("ERP_SUPABASE_INVOICES_TABLE") or "customer_invoices").strip() or "customer_invoices"
+    if not _safe_sql_identifier(t):
+        raise ValueError(f"ERP_SUPABASE_INVOICES_TABLE inválida: {t!r}")
+    return t
+
+
+def _invoices_date_column() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICES_DATE_COL") or "issue_date").strip() or "issue_date"
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICES_DATE_COL inválida: {c!r}")
+    return c
+
+
+def _invoices_customer_id_column() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICES_CUSTOMER_ID_COL") or "customer_id").strip() or "customer_id"
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICES_CUSTOMER_ID_COL inválida: {c!r}")
+    return c
+
+
+def _invoice_number_column() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICES_NUMBER_COL") or "invoice_number").strip() or "invoice_number"
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICES_NUMBER_COL inválida: {c!r}")
+    return c
+
+
+def _invoices_select_expr() -> str:
+    default = "id,invoice_number,issue_date,due_date,total_amount,paid_amount,remaining_amount,status,currency,receipt_type,customer_id"
+    s = (os.environ.get("ERP_SUPABASE_INVOICES_SELECT") or default).strip() or default
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        if not _safe_sql_identifier(p):
+            raise ValueError(f"ERP_SUPABASE_INVOICES_SELECT: columna inválida {p!r}")
+    return ",".join(parts)
+
+
+def _invoice_items_table() -> str:
+    t = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_TABLE") or "customer_invoice_items").strip() or "customer_invoice_items"
+    if not _safe_sql_identifier(t):
+        raise ValueError(f"ERP_SUPABASE_INVOICE_ITEMS_TABLE inválida: {t!r}")
+    return t
+
+
+def _invoice_items_select_expr() -> str:
+    default = "id,customer_invoice_id,product_id,quantity,unit_price,discount_percentage,line_total,tax_rate,description"
+    s = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_SELECT") or default).strip() or default
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        if not _safe_sql_identifier(p):
+            raise ValueError(f"ERP_SUPABASE_INVOICE_ITEMS_SELECT: columna inválida {p!r}")
+    return ",".join(parts)
+
+
+def _payments_table() -> str:
+    t = (os.environ.get("ERP_SUPABASE_PAYMENTS_TABLE") or "customer_payments").strip() or "customer_payments"
+    if not _safe_sql_identifier(t):
+        raise ValueError(f"ERP_SUPABASE_PAYMENTS_TABLE inválida: {t!r}")
+    return t
+
+
+def _payments_select_expr() -> str:
+    default = "id,customer_invoice_id,payment_date,amount,payment_method,reference_number,status,notes"
+    s = (os.environ.get("ERP_SUPABASE_PAYMENTS_SELECT") or default).strip() or default
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    for p in parts:
+        if not _safe_sql_identifier(p):
+            raise ValueError(f"ERP_SUPABASE_PAYMENTS_SELECT: columna inválida {p!r}")
+    return ",".join(parts)
+
+
+def _resolve_invoice_id_by_number(invoice_number: str) -> str | None:
+    client = _get_supabase()
+    assert client is not None
+    table = _invoices_table()
+    number_c = _invoice_number_column()
+    r = client.table(table).select("id").filter(number_c, "eq", invoice_number.strip()).limit(1).execute()
+    rows = r.data or []
+    return str(rows[0]["id"]) if rows and rows[0].get("id") else None
+
+
+# ── Facturas: stubs ─────────────────────────────────────────────────────────
+
+def _stub_list_customer_invoices(desde: str, hasta: str, limit: int) -> dict[str, Any]:
+    demo = [
+        {
+            "id": "00000000-0000-0000-0000-000000000010",
+            "invoice_number": "FC-DEMO-001",
+            "issue_date": desde,
+            "due_date": hasta,
+            "total_amount": 75000.0,
+            "paid_amount": 50000.0,
+            "remaining_amount": 25000.0,
+            "status": "partial",
+            "currency": "ARS",
+            "receipt_type": "factura",
+        }
+    ]
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "facturas": demo[:limit],
+        "cantidad_devuelta": min(len(demo), limit),
+        "fuente": "stub",
+        "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para datos reales",
+    }
+
+
+def _stub_get_invoice_summary(desde: str, hasta: str) -> dict[str, Any]:
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "total_facturado": 500000.0,
+        "total_cobrado": 350000.0,
+        "saldo_pendiente": 150000.0,
+        "cantidad_facturas": 12,
+        "por_estado": {"paid": 5, "partial": 4, "pending": 2, "overdue": 1},
+        "fuente": "stub",
+    }
+
+
+def _stub_list_customer_invoice_items(invoice_id: str, limit: int) -> dict[str, Any]:
+    demo = [
+        {
+            "id": "demo-inv-item-001",
+            "customer_invoice_id": invoice_id,
+            "product_id": "demo-prod-1",
+            "quantity": 2.0,
+            "unit_price": 15000.0,
+            "line_total": 30000.0,
+            "tax_rate": 21.0,
+            "description": "Producto demo",
+        }
+    ]
+    return {
+        "invoice_id": invoice_id,
+        "lineas": demo[:limit],
+        "cantidad_devuelta": min(len(demo), limit),
+        "fuente": "stub",
+    }
+
+
+def _stub_list_customer_payments(limit: int) -> dict[str, Any]:
+    demo = [
+        {
+            "id": "demo-pay-001",
+            "customer_invoice_id": "00000000-0000-0000-0000-000000000010",
+            "payment_date": "2026-01-15",
+            "amount": 50000.0,
+            "payment_method": "bank_transfer",
+            "reference_number": "TRF-DEMO-001",
+            "status": "pending_validation",
+        }
+    ]
+    return {
+        "pagos": demo[:limit],
+        "cantidad_devuelta": min(len(demo), limit),
+        "fuente": "stub",
+    }
+
+
+# ── Facturas: Supabase handlers ─────────────────────────────────────────────
+
+def _list_customer_invoices_from_supabase(
+    desde: str, hasta: str, limit: int,
+    filter_customer_id: str | None = None,
+    filter_status: str | None = None,
+) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _invoices_table()
+    date_c = _invoices_date_column()
+    customer_id_c = _invoices_customer_id_column()
+    select_cols = _invoices_select_expr()
+    lim = max(1, min(limit, 200))
+    q = client.table(table).select(select_cols).gte(date_c, desde).lte(date_c, hasta)
+    if filter_customer_id:
+        q = q.eq(customer_id_c, filter_customer_id)
+    if filter_status:
+        q = q.eq("status", filter_status)
+    r = q.order(date_c, desc=True).limit(lim).execute()
+    rows: list[dict[str, Any]] = r.data or []
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "facturas": rows,
+        "cantidad_devuelta": len(rows),
+        "limite": lim,
+        "fuente": "supabase",
+        "tabla": table,
+    }
+
+
+def _get_invoice_summary_from_supabase(
+    desde: str, hasta: str,
+    filter_customer_id: str | None = None,
+) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _invoices_table()
+    date_c = _invoices_date_column()
+    customer_id_c = _invoices_customer_id_column()
+    q = client.table(table).select(
+        "total_amount,paid_amount,remaining_amount,status"
+    ).gte(date_c, desde).lte(date_c, hasta)
+    if filter_customer_id:
+        q = q.eq(customer_id_c, filter_customer_id)
+    r = q.limit(5000).execute()
+    rows: list[dict[str, Any]] = r.data or []
+    total_facturado = sum(float(x.get("total_amount") or 0) for x in rows)
+    total_cobrado = sum(float(x.get("paid_amount") or 0) for x in rows)
+    saldo_pendiente = sum(float(x.get("remaining_amount") or 0) for x in rows)
+    por_estado: dict[str, int] = {}
+    for x in rows:
+        st = str(x.get("status") or "unknown")
+        por_estado[st] = por_estado.get(st, 0) + 1
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "total_facturado": round(total_facturado, 2),
+        "total_cobrado": round(total_cobrado, 2),
+        "saldo_pendiente": round(saldo_pendiente, 2),
+        "cantidad_facturas": len(rows),
+        "por_estado": por_estado,
+        "fuente": "supabase",
+        "tabla": table,
+    }
+
+
+def _list_customer_invoice_items_from_supabase(invoice_id: str, limit: int) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _invoice_items_table()
+    select_cols = _invoice_items_select_expr()
+    lim = max(1, min(limit, 500))
+    r = client.table(table).select(select_cols).eq("customer_invoice_id", invoice_id.strip()).limit(lim).execute()
+    rows: list[dict[str, Any]] = r.data or []
+    return {
+        "invoice_id": invoice_id.strip(),
+        "lineas": rows,
+        "cantidad_devuelta": len(rows),
+        "limite": lim,
+        "fuente": "supabase",
+        "tabla": table,
+    }
+
+
+def _list_customer_payments_from_supabase(
+    limit: int,
+    filter_invoice_id: str | None = None,
+    filter_customer_id: str | None = None,
+    desde: str | None = None,
+    hasta: str | None = None,
+) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _payments_table()
+    select_cols = _payments_select_expr()
+    lim = max(1, min(limit, 200))
+    q = client.table(table).select(select_cols)
+    if filter_invoice_id:
+        q = q.eq("customer_invoice_id", filter_invoice_id)
+    if desde:
+        q = q.gte("payment_date", desde)
+    if hasta:
+        q = q.lte("payment_date", hasta)
+    if filter_customer_id and not filter_invoice_id:
+        inv_table = _invoices_table()
+        inv_r = (
+            client.table(inv_table)
+            .select("id")
+            .eq(_invoices_customer_id_column(), filter_customer_id)
+            .limit(500)
+            .execute()
+        )
+        inv_ids = [x["id"] for x in (inv_r.data or []) if x.get("id")]
+        if not inv_ids:
+            return {"pagos": [], "cantidad_devuelta": 0, "fuente": "supabase"}
+        q = q.in_("customer_invoice_id", inv_ids)
+    r = q.order("payment_date", desc=True).limit(lim).execute()
+    rows: list[dict[str, Any]] = r.data or []
+    return {
+        "pagos": rows,
+        "cantidad_devuelta": len(rows),
+        "limite": lim,
+        "fuente": "supabase",
+        "tabla": table,
+    }
 
 
 def _stub_list_sales_orders(desde: str, hasta: str, limit: int) -> dict[str, Any]:
@@ -2448,6 +2884,95 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _list_sales_order_items_from_supabase(oid, lim)
             else:
                 result = _stub_list_sales_order_items(oid, lim)
+        elif name == "list_customer_invoices":
+            lim = _coerce_limit(args.get("limit"), default=30, cap=200)
+            try:
+                desde, hasta = _resolve_orders_list_dates(args.get("desde"), args.get("hasta"))
+            except ValueError as e:
+                return json.dumps({"error": str(e)}, ensure_ascii=False)
+            filter_cid: str | None = None
+            if use_sb:
+                cid_raw = str(args.get("customer_id") or "").strip()
+                cname_raw = str(args.get("customer_name") or "").strip()
+                if cid_raw:
+                    filter_cid = cid_raw
+                elif cname_raw:
+                    filter_cid = _resolve_customer_id_by_name(cname_raw)
+                    if not filter_cid:
+                        return json.dumps({"error": f"No se encontró cliente: {cname_raw!r}"}, ensure_ascii=False)
+                status_raw = str(args.get("status") or "").strip() or None
+                result = _list_customer_invoices_from_supabase(desde, hasta, lim, filter_cid, status_raw)
+            else:
+                result = _stub_list_customer_invoices(desde, hasta, lim)
+        elif name == "get_invoice_summary":
+            desde, hasta = str(args["desde"]), str(args["hasta"])
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", desde) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", hasta):
+                return json.dumps({"error": "fechas deben ser YYYY-MM-DD"}, ensure_ascii=False)
+            filter_cid = None
+            if use_sb:
+                cid_raw = str(args.get("customer_id") or "").strip()
+                cname_raw = str(args.get("customer_name") or "").strip()
+                if cid_raw:
+                    filter_cid = cid_raw
+                elif cname_raw:
+                    filter_cid = _resolve_customer_id_by_name(cname_raw)
+                    if not filter_cid:
+                        return json.dumps({"error": f"No se encontró cliente: {cname_raw!r}"}, ensure_ascii=False)
+                result = _get_invoice_summary_from_supabase(desde, hasta, filter_cid)
+            else:
+                result = _stub_get_invoice_summary(desde, hasta)
+        elif name == "list_customer_invoice_items":
+            lim = _coerce_limit(args.get("limit"), default=100, cap=500)
+            inv_id = str(args.get("invoice_id") or "").strip()
+            inv_num = str(args.get("invoice_number") or "").strip()
+            if not inv_id and not inv_num:
+                return json.dumps({"error": "Requerido: invoice_id (UUID) o invoice_number"}, ensure_ascii=False)
+            if not inv_id or not _is_uuid(inv_id):
+                if use_sb and inv_num:
+                    resolved = _resolve_invoice_id_by_number(inv_num)
+                    if not resolved:
+                        return json.dumps({"error": f"No se encontró la factura {inv_num!r}"}, ensure_ascii=False)
+                    inv_id = resolved
+                elif not use_sb:
+                    inv_id = inv_id or inv_num
+                else:
+                    return json.dumps({"error": "invoice_id debe ser UUID válido, o proveer invoice_number"}, ensure_ascii=False)
+            if use_sb:
+                result = _list_customer_invoice_items_from_supabase(inv_id, lim)
+            else:
+                result = _stub_list_customer_invoice_items(inv_id, lim)
+        elif name == "list_customer_payments":
+            lim = _coerce_limit(args.get("limit"), default=50, cap=200)
+            inv_id = str(args.get("invoice_id") or "").strip()
+            inv_num = str(args.get("invoice_number") or "").strip()
+            desde_p = str(args.get("desde") or "").strip() or None
+            hasta_p = str(args.get("hasta") or "").strip() or None
+            filter_cid = None
+            if use_sb:
+                if inv_num and (not inv_id or not _is_uuid(inv_id)):
+                    resolved = _resolve_invoice_id_by_number(inv_num)
+                    if not resolved:
+                        return json.dumps({"error": f"No se encontró la factura {inv_num!r}"}, ensure_ascii=False)
+                    inv_id = resolved
+                cid_raw = str(args.get("customer_id") or "").strip()
+                cname_raw = str(args.get("customer_name") or "").strip()
+                if cid_raw:
+                    filter_cid = cid_raw
+                elif cname_raw:
+                    filter_cid = _resolve_customer_id_by_name(cname_raw)
+                    if not filter_cid:
+                        return json.dumps({"error": f"No se encontró cliente: {cname_raw!r}"}, ensure_ascii=False)
+                if not inv_id and not filter_cid and not desde_p:
+                    return json.dumps({"error": "Requerido: invoice_id, invoice_number, customer_name/id, o rango de fechas"}, ensure_ascii=False)
+                result = _list_customer_payments_from_supabase(
+                    lim,
+                    filter_invoice_id=inv_id or None,
+                    filter_customer_id=filter_cid,
+                    desde=desde_p,
+                    hasta=hasta_p,
+                )
+            else:
+                result = _stub_list_customer_payments(lim)
         else:
             return json.dumps({"error": f"tool desconocida: {name}"})
         return json.dumps(result, ensure_ascii=False)
