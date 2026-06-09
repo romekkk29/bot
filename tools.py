@@ -1563,6 +1563,7 @@ def _list_customer_invoices_from_supabase(
         q = q.eq("status", filter_status)
     r = q.order(date_c, desc=True).limit(lim).execute()
     rows: list[dict[str, Any]] = r.data or []
+    rows = _attach_customers_to_orders(rows, customer_id_c)
     return {
         "periodo": {"desde": desde, "hasta": hasta},
         "facturas": rows,
