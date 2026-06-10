@@ -261,8 +261,11 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_product_available_stock",
             "description": (
-                "Consulta stock disponible de un producto por nombre/código/SKU/barcode. "
-                "Resuelve el producto en products y luego calcula stock disponible desde warehouse_stock."
+                "Consulta stock de un producto por nombre/código/SKU/barcode. "
+                "Devuelve: stock total, stock reservado, stock disponible (total-reservado), "
+                "stock proyectado (columna stock_projected de warehouse_stock) y stock mínimo. "
+                "Usar cuando pregunten por stock disponible, stock proyectado, stock actual, "
+                "cuánto hay de un artículo, o cuánto queda de un producto."
             ),
             "parameters": {
                 "type": "object",
