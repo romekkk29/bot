@@ -309,6 +309,39 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_top_products_by_stock",
+            "description": (
+                "Lista los N productos con mayor (o menor) cantidad de stock disponible. "
+                "Usar cuando pregunten cuál es el producto con más stock, top de inventario, "
+                "qué artículo tiene mayor/menor cantidad disponible."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Cantidad de productos a devolver (default 10, máx 100)",
+                    },
+                    "order": {
+                        "type": "string",
+                        "description": "'desc' para mayor stock primero (default), 'asc' para menor stock primero",
+                    },
+                    "warehouse_name": {
+                        "type": "string",
+                        "description": "Nombre del almacén a consultar (opcional; si se omite suma todos los depósitos)",
+                    },
+                    "only_principal": {
+                        "type": "boolean",
+                        "description": "Si true, filtra solo el depósito de tipo 'principal' (default false)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_recent_product_movements",
             "description": (
                 "Muestra ingresos/egresos recientes de un artículo usando cardex_report. "
@@ -2618,6 +2651,88 @@ def _products_below_min_stock_from_supabase(limit: int) -> dict[str, Any]:
     }
 
 
+def _stub_top_products_by_stock(limit: int, order: str) -> dict[str, Any]:
+    demo = [
+        {"sku": "SKU-DEMO-001", "nombre": "Producto Demo A", "stock_disponible": 500.0, "stock_reservado": 10.0},
+        {"sku": "SKU-DEMO-002", "nombre": "Producto Demo B", "stock_disponible": 320.0, "stock_reservado": 0.0},
+    ]
+    return {
+        "productos": demo[:limit],
+        "cantidad_devuelta": min(len(demo), limit),
+        "orden": order,
+        "fuente": "stub",
+    }
+
+
+def _top_products_by_stock_from_supabase(
+    limit: int, order: str, warehouse_name: str | None = None, only_principal: bool = False
+) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    ws_table, ws_product_c, ws_warehouse_c, ws_stock_c, ws_reserved_c, ws_min_c, _ = _warehouse_stock_column_config()
+    _, code_c, name_c, uuid_c = _product_table_columns()
+    if not uuid_c:
+        raise ValueError("ERP_SUPABASE_PRODUCT_COL_UUID es obligatorio para consultas de stock")
+
+    filter_wh_id: str | None = None
+    if warehouse_name or only_principal:
+        wh_query = client.table("warehouses").select("id,name,type").eq("is_active", True)
+        if only_principal:
+            wh_query = wh_query.eq("type", "principal")
+        elif warehouse_name:
+            wh_query = wh_query.filter("name", "ilike", f"%{warehouse_name.strip()}%")
+        wh_r = wh_query.limit(1).execute()
+        wh_rows = wh_r.data or []
+        if not wh_rows:
+            label = "principal" if only_principal else warehouse_name
+            raise ValueError(f"No se encontró almacén: {label!r}")
+        filter_wh_id = wh_rows[0]["id"]
+        warehouse_label = wh_rows[0]["name"]
+    else:
+        warehouse_label = "todos"
+
+    lim = max(1, min(limit, 100))
+    desc = order.lower() != "asc"
+
+    q = client.table(ws_table).select(f"{ws_product_c},{ws_stock_c},{ws_reserved_c}")
+    if filter_wh_id:
+        q = q.eq(ws_warehouse_c, filter_wh_id)
+    q = q.gt(ws_stock_c, 0).order(ws_stock_c, desc=desc).limit(lim)
+    stock_rows: list[dict[str, Any]] = q.execute().data or []
+
+    product_ids = [r[ws_product_c] for r in stock_rows if r.get(ws_product_c)]
+    prod_map: dict[str, dict[str, Any]] = {}
+    if product_ids:
+        chunk_sz = 100
+        for i in range(0, len(product_ids), chunk_sz):
+            chunk = product_ids[i : i + chunk_sz]
+            p_r = client.table("products").select(f"{uuid_c},{code_c},{name_c}").in_(uuid_c, chunk).execute()
+            for p in p_r.data or []:
+                prod_map[p[uuid_c]] = p
+
+    results: list[dict[str, Any]] = []
+    for row in stock_rows:
+        pid = row.get(ws_product_c)
+        prod = prod_map.get(pid) or {}
+        stock_v = _to_float(row.get(ws_stock_c))
+        reserved_v = _to_float(row.get(ws_reserved_c))
+        results.append({
+            "sku": prod.get(code_c),
+            "nombre": prod.get(name_c),
+            "stock_disponible": round(stock_v - reserved_v, 3),
+            "stock_total": round(stock_v, 3),
+            "stock_reservado": round(reserved_v, 3),
+        })
+
+    return {
+        "productos": results,
+        "cantidad_devuelta": len(results),
+        "orden": "mayor_primero" if desc else "menor_primero",
+        "almacen": warehouse_label,
+        "fuente": "supabase",
+    }
+
+
 def _stub_recent_product_movements(query: str, days: int, limit: int) -> dict[str, Any]:
     now = datetime.utcnow().isoformat()
     demo = [
@@ -2858,6 +2973,17 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _products_below_min_stock_from_supabase(lim)
             else:
                 result = _stub_products_below_min_stock(lim)
+        elif name == "list_top_products_by_stock":
+            lim = _coerce_limit(args.get("limit"), default=10, cap=100)
+            order = str(args.get("order") or "desc").strip().lower()
+            if order not in ("asc", "desc"):
+                order = "desc"
+            wh_name = str(args.get("warehouse_name") or "").strip() or None
+            only_principal = bool(args.get("only_principal") or False)
+            if use_sb:
+                result = _top_products_by_stock_from_supabase(lim, order, wh_name, only_principal)
+            else:
+                result = _stub_top_products_by_stock(lim, order)
         elif name == "list_recent_product_movements":
             lim = _coerce_limit(args.get("limit"), default=20, cap=100)
             days = _coerce_limit(args.get("days"), default=7, cap=90)
