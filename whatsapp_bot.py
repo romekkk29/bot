@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import date
 from typing import Any
@@ -15,7 +16,7 @@ from fastapi.responses import JSONResponse
 from groq import Groq
 from pydantic import BaseModel, Field
 
-from tools import TOOLS, data_backend_label, dispatch_tool
+from tools import TOOLS, data_backend_label, dispatch_tool, _get_supabase
 
 # Cargar variables de entorno
 load_dotenv()
@@ -81,6 +82,34 @@ class KapsoWebhook(BaseModel):
 # Historial de conversaciones por número de teléfono
 conversation_history: dict[str, list[dict]] = {}
 
+# Caché de perfiles resueltos por número de teléfono
+_profile_cache: dict[str, dict | None] = {}
+
+
+def _resolve_profile_by_phone(from_number: str) -> dict | None:
+    """Busca full_name y email en profiles usando los últimos dígitos del número."""
+    if from_number in _profile_cache:
+        return _profile_cache[from_number]
+    client = _get_supabase()
+    if not client:
+        _profile_cache[from_number] = None
+        return None
+    digits = re.sub(r'\D', '', from_number)
+    result: dict | None = None
+    for n in (10, 9, 8):
+        suffix = digits[-n:] if len(digits) >= n else digits
+        try:
+            phone_int = int(suffix)
+            r = client.table("profiles").select("full_name,email,phone").eq("phone", phone_int).eq("is_active", True).limit(1).execute()
+            if r.data:
+                result = r.data[0]
+                break
+        except Exception:
+            continue
+    _profile_cache[from_number] = result
+    print(f"[PROFILE] {from_number!r} → {result}", file=sys.stderr)
+    return result
+
 # Deduplicación de webhooks ya procesados
 processed_ids: set[str] = set()
 
@@ -91,11 +120,18 @@ MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "6"))
 MAX_TOOL_OUTPUT_CHARS = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "3000"))
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(user_info: dict | None = None) -> str:
     hoy = date.today().isoformat()
+    if user_info:
+        nombre = user_info.get("full_name") or "(sin nombre)"
+        email = user_info.get("email") or "(sin email)"
+        user_line = f"El usuario que te está escribiendo es: {nombre} ({email})."
+    else:
+        user_line = "No se pudo identificar al usuario en la base de datos."
     return f"""Sos el asistente del ERP de la empresa por WhatsApp.
 Respondés en español, claro y breve.
 Fecha actual de referencia: {hoy}.
+{user_line}
 Para datos de ventas o compras (totales, listados, conteo por estado, líneas de una OC), stock disponible, productos bajo mínimo, movimientos de cardex, productos, proveedores o clientes NO inventes números: usá las herramientas disponibles.
 Si el usuario pide períodos relativos (ej: 'último mes'), inferí fechas usando la fecha actual y llamá la tool.
 Si usaste herramientas y devolvieron datos, tratá esos datos como reales de esta consulta.
@@ -396,8 +432,9 @@ async def whatsapp_webhook(request: Request):
 
         # Obtener o crear historial
         if from_number not in conversation_history:
+            user_info = _resolve_profile_by_phone(from_number)
             conversation_history[from_number] = [
-                {"role": "system", "content": _build_system_prompt()}
+                {"role": "system", "content": _build_system_prompt(user_info)}
             ]
 
         conversation_history[from_number].append({"role": "user", "content": message_text})
