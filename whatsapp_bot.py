@@ -87,7 +87,7 @@ _profile_cache: dict[str, dict | None] = {}
 
 
 def _resolve_profile_by_phone(from_number: str) -> dict | None:
-    """Busca full_name y email en profiles usando los últimos dígitos del número."""
+    """Busca full_name, email y roles del usuario usando los últimos dígitos del número."""
     if from_number in _profile_cache:
         return _profile_cache[from_number]
     client = _get_supabase()
@@ -100,12 +100,20 @@ def _resolve_profile_by_phone(from_number: str) -> dict | None:
         suffix = digits[-n:] if len(digits) >= n else digits
         try:
             phone_int = int(suffix)
-            r = client.table("profiles").select("full_name,email,phone").eq("phone", phone_int).eq("is_active", True).limit(1).execute()
+            r = client.table("profiles").select("user_id,full_name,email,phone").eq("phone", phone_int).eq("is_active", True).limit(1).execute()
             if r.data:
-                result = r.data[0]
+                result = dict(r.data[0])
                 break
         except Exception:
             continue
+    if result:
+        user_id = result.get("user_id")
+        if user_id:
+            try:
+                rr = client.table("user_roles").select("role").eq("user_id", user_id).execute()
+                result["roles"] = [row["role"] for row in (rr.data or []) if row.get("role")]
+            except Exception:
+                result["roles"] = []
     _profile_cache[from_number] = result
     print(f"[PROFILE] {from_number!r} → {result}", file=sys.stderr)
     return result
@@ -125,7 +133,9 @@ def _build_system_prompt(user_info: dict | None = None) -> str:
     if user_info:
         nombre = user_info.get("full_name") or "(sin nombre)"
         email = user_info.get("email") or "(sin email)"
-        user_line = f"El usuario que te está escribiendo es: {nombre} ({email})."
+        roles = user_info.get("roles") or []
+        rol_str = ", ".join(roles) if roles else "sin rol asignado"
+        user_line = f"El usuario que te está escribiendo es: {nombre} ({email}). Rol(es): {rol_str}."
     else:
         user_line = "No se pudo identificar al usuario en la base de datos."
     return f"""Sos el asistente del ERP de la empresa por WhatsApp.
