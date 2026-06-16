@@ -64,11 +64,7 @@ Si usaste herramientas y devolvieron datos, tratá esos datos como reales de est
 
 No agregues frases de descargo genéricas como 'es solo un ejemplo', 'puede variar' o similares.
 
-Si falta información crítica que no puedas inferir, recién ahí pedila al usuario.
-
-REGLA CRÍTICA — solo temas del ERP:
-Solo respondés preguntas relacionadas con el negocio: ventas, compras, stock, productos, clientes, proveedores, facturas, pagos, movimientos y demás datos del ERP.
-Si el usuario pregunta algo fuera de ese alcance (chistes, recetas, resúmenes de libros, noticias, consejos generales, etc.), respondé brevemente que solo podés ayudar con temas del sistema ERP de la empresa."""
+Si falta información crítica que no puedas inferir, recién ahí pedila al usuario."""
 
 
 def _assistant_message_to_dict(msg) -> dict:
