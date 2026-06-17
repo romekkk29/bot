@@ -12,6 +12,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from groq import Groq
 from pydantic import BaseModel, Field
@@ -51,6 +52,25 @@ else:
 # Inicializar FastAPI
 app = FastAPI(title="ERP WhatsApp Bot")
 
+# CORS: permite requests desde el frontend React
+_CORS_ORIGINS_ENV = os.environ.get("CORS_ORIGINS", "").strip()
+_CORS_ORIGINS: list[str] = (
+    [o.strip() for o in _CORS_ORIGINS_ENV.split(",") if o.strip()]
+    if _CORS_ORIGINS_ENV
+    else ["*"]
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# API Key opcional para el endpoint /api/chat
+API_CHAT_KEY = os.environ.get("API_CHAT_KEY", "").strip()
+
 
 # Modelos de datos
 class WhatsAppMessage(BaseModel):
@@ -79,11 +99,42 @@ class KapsoWebhook(BaseModel):
     model_config = {"extra": "allow"}
 
 
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+    session_id: str | None = None  # si no se provee, se usa user_id como clave de sesión
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    session_id: str
+    user: dict | None = None
+
+
 # Historial de conversaciones por número de teléfono
 conversation_history: dict[str, list[dict]] = {}
 
 # Caché de perfiles resueltos por número de teléfono
 _profile_cache: dict[str, dict | None] = {}
+
+
+def _resolve_profile_by_user_id(user_id: str) -> dict | None:
+    """Resuelve perfil y roles directamente por user_id (UUID)."""
+    client = _get_supabase()
+    if not client:
+        return None
+    try:
+        r = client.table("profiles").select("user_id,full_name,email").eq("user_id", user_id).eq("is_active", True).limit(1).execute()
+        if not r.data:
+            return None
+        result = dict(r.data[0])
+        rr = client.table("user_roles").select("role").eq("user_id", user_id).execute()
+        result["roles"] = [row["role"] for row in (rr.data or []) if row.get("role")]
+        print(f"[PROFILE/API] user_id={user_id!r} → {result}", file=sys.stderr)
+        return result
+    except Exception as e:
+        print(f"[PROFILE/API] Error: {e}", file=sys.stderr)
+        return None
 
 
 def _resolve_profile_by_phone(from_number: str) -> dict | None:
@@ -546,6 +597,69 @@ async def clear_history(phone_number: str):
     if phone_number in conversation_history:
         del conversation_history[phone_number]
     return {"status": "cleared"}
+
+
+# ---------------------------------------------------------------------------
+# Endpoint de API genérica (sin WhatsApp)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/chat", response_model=ChatResponse)
+async def api_chat(req: ChatRequest, request: Request):
+    """Endpoint de chat genérico. Recibe user_id + message y devuelve la respuesta del bot."""
+    # Verificación opcional de API key
+    if API_CHAT_KEY:
+        incoming_key = request.headers.get("X-API-Key", "")
+        if incoming_key != API_CHAT_KEY:
+            raise HTTPException(status_code=401, detail="API key inválida o ausente")
+
+    session_key = req.session_id or req.user_id
+
+    user_info = _resolve_profile_by_user_id(req.user_id)
+
+    if session_key not in conversation_history:
+        conversation_history[session_key] = [
+            {"role": "system", "content": _build_system_prompt(user_info)}
+        ]
+
+    conversation_history[session_key].append({"role": "user", "content": req.message})
+
+    hist = conversation_history[session_key]
+    system_msgs = [m for m in hist if m["role"] == "system"]
+    non_system = [m for m in hist if m["role"] != "system"]
+    if len(non_system) > MAX_HISTORY_TURNS:
+        non_system = non_system[-MAX_HISTORY_TURNS:]
+    conversation_history[session_key] = system_msgs + non_system
+
+    try:
+        reply = run_turn(list(conversation_history[session_key]))
+        conversation_history[session_key].append({"role": "assistant", "content": reply})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return ChatResponse(
+        reply=reply,
+        session_id=session_key,
+        user={
+            "full_name": user_info.get("full_name") if user_info else None,
+            "email": user_info.get("email") if user_info else None,
+            "roles": user_info.get("roles") if user_info else [],
+        },
+    )
+
+
+@app.get("/api/history/{session_id}")
+async def api_get_history(session_id: str):
+    """Devuelve el historial de una sesión de API."""
+    history = conversation_history.get(session_id, [])
+    return {"session_id": session_id, "history": [m for m in history if m["role"] != "system"]}
+
+
+@app.delete("/api/history/{session_id}")
+async def api_clear_history(session_id: str):
+    """Limpia el historial de una sesión de API."""
+    if session_id in conversation_history:
+        del conversation_history[session_id]
+    return {"status": "cleared", "session_id": session_id}
 
 
 if __name__ == "__main__":
