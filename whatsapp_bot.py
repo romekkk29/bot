@@ -17,7 +17,10 @@ from fastapi.responses import JSONResponse
 from groq import Groq
 from pydantic import BaseModel, Field
 
-from tools import TOOLS, data_backend_label, dispatch_tool, _get_supabase
+from tools import (
+    TOOLS, data_backend_label, dispatch_tool, _get_supabase,
+    _get_supabase_for_key, set_request_supabase, _request_supabase_override,
+)
 
 # Cargar variables de entorno
 load_dotenv()
@@ -103,6 +106,7 @@ class ChatRequest(BaseModel):
     user_id: str
     message: str
     session_id: str | None = None  # si no se provee, se usa user_id como clave de sesión
+    db_key: str | None = None      # identificador de base de datos, ej: 'ALPINA_PROD'
 
 
 class ChatResponse(BaseModel):
@@ -609,36 +613,63 @@ async def clear_history(phone_number: str):
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def api_chat(req: ChatRequest, request: Request):
-    """Endpoint de chat genérico. Recibe user_id + message y devuelve la respuesta del bot."""
+    """Endpoint de chat genérico. Recibe user_id + message (+ db_key opcional) y devuelve la respuesta del bot."""
     # Verificación opcional de API key
     if API_CHAT_KEY:
         incoming_key = request.headers.get("X-API-Key", "")
         if incoming_key != API_CHAT_KEY:
             raise HTTPException(status_code=401, detail="API key inválida o ausente")
 
-    session_key = req.session_id or req.user_id
-
-    user_info = _resolve_profile_by_user_id(req.user_id)
-
-    if session_key not in conversation_history:
-        conversation_history[session_key] = [
-            {"role": "system", "content": _build_system_prompt(user_info)}
-        ]
-
-    conversation_history[session_key].append({"role": "user", "content": req.message})
-
-    hist = conversation_history[session_key]
-    system_msgs = [m for m in hist if m["role"] == "system"]
-    non_system = [m for m in hist if m["role"] != "system"]
-    if len(non_system) > MAX_HISTORY_TURNS:
-        non_system = non_system[-MAX_HISTORY_TURNS:]
-    conversation_history[session_key] = system_msgs + non_system
+    # --- Resolución de base de datos (multi-tenant) ---
+    db_token = None
+    if req.db_key:
+        tenant_client = _get_supabase_for_key(req.db_key)
+        if tenant_client is None:
+            safe = req.db_key.strip().upper()
+            print(f"[API/CHAT] db_key={safe!r} no encontrado en variables de entorno", file=sys.stderr)
+            return ChatResponse(
+                reply="No estoy vinculado a una base de datos correspondiente. Verificá el identificador de base de datos con el administrador.",
+                session_id=req.session_id or req.user_id,
+                user=None,
+            )
+        db_token = set_request_supabase(tenant_client)
+        print(f"[API/CHAT] Usando db_key={req.db_key.upper()!r}", file=sys.stderr)
+    else:
+        # Sin db_key: usa cliente global (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)
+        if not _get_supabase():
+            return ChatResponse(
+                reply="No estoy vinculado a ninguna base de datos. Configurá SUPABASE_URL y SUPABASE_SERVICE_ROLE_KEY o enviá un db_key válido.",
+                session_id=req.session_id or req.user_id,
+                user=None,
+            )
 
     try:
+        session_key = req.session_id or req.user_id
+
+        user_info = _resolve_profile_by_user_id(req.user_id)
+
+        if session_key not in conversation_history:
+            conversation_history[session_key] = [
+                {"role": "system", "content": _build_system_prompt(user_info)}
+            ]
+
+        conversation_history[session_key].append({"role": "user", "content": req.message})
+
+        hist = conversation_history[session_key]
+        system_msgs = [m for m in hist if m["role"] == "system"]
+        non_system = [m for m in hist if m["role"] != "system"]
+        if len(non_system) > MAX_HISTORY_TURNS:
+            non_system = non_system[-MAX_HISTORY_TURNS:]
+        conversation_history[session_key] = system_msgs + non_system
+
         reply = run_turn(list(conversation_history[session_key]))
         conversation_history[session_key].append({"role": "assistant", "content": reply})
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if db_token is not None:
+            _request_supabase_override.reset(db_token)
 
     return ChatResponse(
         reply=reply,

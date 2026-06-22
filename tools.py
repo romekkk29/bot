@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -648,8 +649,16 @@ TOOLS: list[dict[str, Any]] = [
 
 _supabase_client: Any | None = None
 
+# ContextVar para override por request (multi-tenant, async-safe)
+_request_supabase_override: ContextVar[Any | None] = ContextVar("_request_supabase_override", default=None)
+
+# Caché de clientes por db_key
+_supabase_client_by_key: dict[str, Any] = {}
+
 
 def data_backend_label() -> str:
+    if _request_supabase_override.get() is not None:
+        return "supabase"
     if _supabase_credentials():
         return "supabase"
     return "stub"
@@ -667,16 +676,47 @@ def _supabase_credentials() -> tuple[str, str] | None:
 
 
 def _get_supabase():
+    # Primero: override por request (multi-tenant)
+    override = _request_supabase_override.get()
+    if override is not None:
+        return override
+    # Fallback: cliente global singleton
     global _supabase_client
     creds = _supabase_credentials()
     if not creds:
         return None
     if _supabase_client is None:
         from supabase import create_client
-
         url, key = creds
         _supabase_client = create_client(url, key)
     return _supabase_client
+
+
+def _get_supabase_for_key(db_key: str) -> Any | None:
+    """Devuelve cliente Supabase para el tenant db_key, o None si no hay credenciales.
+    
+    Busca SUPABASE_URL_{DB_KEY} y SUPABASE_SERVICE_ROLE_KEY_{DB_KEY} en el entorno.
+    Ejemplo: db_key='ALPINA_PROD' → SUPABASE_URL_ALPINA_PROD + SUPABASE_SERVICE_ROLE_KEY_ALPINA_PROD
+    """
+    safe = db_key.strip().upper()
+    if safe in _supabase_client_by_key:
+        return _supabase_client_by_key[safe]
+    url = os.environ.get(f"SUPABASE_URL_{safe}", "").strip()
+    key = os.environ.get(f"SUPABASE_SERVICE_ROLE_KEY_{safe}", "").strip()
+    if not url or not key:
+        return None
+    from supabase import create_client
+    client = create_client(url, key)
+    _supabase_client_by_key[safe] = client
+    return client
+
+
+def set_request_supabase(client: Any | None):
+    """Establece el cliente Supabase activo para el request actual (ContextVar).
+    
+    Retorna el Token para poder resetear con _request_supabase_override.reset(token).
+    """
+    return _request_supabase_override.set(client)
 
 
 def _sales_table() -> str:
