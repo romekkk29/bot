@@ -670,6 +670,24 @@ async def api_chat(req: ChatRequest, request: Request):
         print(f"[API/CHAT ERROR] user_id={req.user_id!r} db_key={req.db_key!r} msg={req.message!r}", file=sys.stderr)
         print(f"[API/CHAT ERROR] {type(e).__name__}: {e}", file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+        err_str = str(e)
+        is_token_error = (
+            "413" in err_str
+            or "rate_limit_exceeded" in err_str
+            or "Request too large" in err_str
+            or ("tokens" in err_str.lower() and "limit" in err_str.lower())
+        )
+        if is_token_error:
+            _sk = req.session_id or req.user_id
+            if _sk and _sk in conversation_history:
+                sys_msgs = [m for m in conversation_history[_sk] if m["role"] == "system"]
+                conversation_history[_sk] = sys_msgs
+                print(f"[API/CHAT] Historial limpiado por token overflow en sesión {_sk!r}", file=sys.stderr)
+            return ChatResponse(
+                reply="La conversación acumuló demasiado contexto y no pudo procesarse. El historial fue reiniciado automáticamente. Por favor repetí tu pregunta.",
+                session_id=_sk,
+                user={"full_name": None, "email": None, "roles": []},
+            )
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if db_token is not None:
