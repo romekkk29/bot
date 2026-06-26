@@ -55,16 +55,10 @@ else:
 # Inicializar FastAPI
 app = FastAPI(title="ERP WhatsApp Bot")
 
-# CORS: permite requests desde el frontend React
-_CORS_ORIGINS_ENV = os.environ.get("CORS_ORIGINS", "").strip()
-_CORS_ORIGINS: list[str] = (
-    [o.strip() for o in _CORS_ORIGINS_ENV.split(",") if o.strip()]
-    if _CORS_ORIGINS_ENV
-    else ["*"]
-)
+# CORS: permite requests desde cualquier origen
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_CORS_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -672,6 +666,10 @@ async def api_chat(req: ChatRequest, request: Request):
         conversation_history[session_key].append({"role": "assistant", "content": reply})
 
     except Exception as e:
+        import traceback
+        print(f"[API/CHAT ERROR] user_id={req.user_id!r} db_key={req.db_key!r} msg={req.message!r}", file=sys.stderr)
+        print(f"[API/CHAT ERROR] {type(e).__name__}: {e}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if db_token is not None:
