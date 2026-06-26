@@ -645,6 +645,31 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_products_without_stock_days",
+            "description": (
+                "Lista productos que tienen stock = 0 y cuyo registro no fue actualizado en los últimos N días. "
+                "Usar cuando pregunten: 'productos sin stock los últimos X días', 'productos que no tuvieron stock', "
+                "'artículos con stock cero hace más de X días', 'qué productos llevan X días sin stock'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "days": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Cantidad de días sin stock (default 15)",
+                    },
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Máximo de filas (default 50, máx 200)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
 ]
 
 _supabase_client: Any | None = None
@@ -2707,6 +2732,76 @@ def _stub_top_products_by_stock(limit: int, order: str) -> dict[str, Any]:
     }
 
 
+def _stub_products_without_stock_days(days: int, limit: int) -> dict[str, Any]:
+    return {
+        "resultados": [
+            {"sku_o_codigo": "DEMO-001", "nombre": "Producto Demo", "stock": 0, "updated_at": "2024-01-01", "dias_sin_stock": days}
+        ],
+        "cantidad_devuelta": 1,
+        "dias_sin_stock": days,
+        "fuente": "stub",
+        "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para leer datos reales",
+    }
+
+
+def _products_without_stock_days_from_supabase(days: int, limit: int) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    ws_table, ws_product_c, ws_warehouse_c, ws_stock_c, _, _, _ = _warehouse_stock_column_config()
+    updated_at_c = (
+        os.environ.get("ERP_SUPABASE_WAREHOUSE_STOCK_UPDATED_AT_COL", "updated_at") or "updated_at"
+    ).strip()
+    _, code_c, name_c, uuid_c = _product_table_columns()
+
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+
+    select_cols = ",".join(filter(None, [ws_product_c, ws_warehouse_c, ws_stock_c, updated_at_c]))
+    r = (
+        client.table(ws_table)
+        .select(select_cols)
+        .eq(ws_stock_c, 0)
+        .lte(updated_at_c, cutoff)
+        .limit(max(1, min(limit * 2, 500)))
+        .execute()
+    )
+    rows: list[dict[str, Any]] = r.data or []
+
+    pids = list(dict.fromkeys(row.get(ws_product_c) for row in rows if row.get(ws_product_c)))
+    by_id: dict[Any, dict[str, Any]] = {}
+    if pids and uuid_c:
+        chunk_sz = 200
+        for i in range(0, len(pids), chunk_sz):
+            pr = client.table(_products_table()).select(f"{uuid_c},{code_c},{name_c}").in_(uuid_c, pids[i:i+chunk_sz]).execute()
+            for p in pr.data or []:
+                by_id[p.get(uuid_c)] = p
+
+    out: list[dict[str, Any]] = []
+    seen_pids: set = set()
+    for row in rows:
+        pid = row.get(ws_product_c)
+        if pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        prod = by_id.get(pid, {})
+        out.append({
+            "product_id": pid,
+            "sku_o_codigo": prod.get(code_c),
+            "nombre": prod.get(name_c),
+            "stock": _to_float(row.get(ws_stock_c)),
+            "updated_at": row.get(updated_at_c),
+        })
+        if len(out) >= limit:
+            break
+
+    return {
+        "resultados": out,
+        "cantidad_devuelta": len(out),
+        "dias_sin_stock": days,
+        "corte_fecha": cutoff,
+        "fuente": "supabase",
+    }
+
+
 def _top_products_by_stock_from_supabase(
     limit: int, order: str, warehouse_name: str | None = None, only_principal: bool = False
 ) -> dict[str, Any]:
@@ -3143,6 +3238,13 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 )
             else:
                 result = _stub_list_customer_payments(lim)
+        elif name == "list_products_without_stock_days":
+            days = _coerce_limit(args.get("days"), default=15, cap=365)
+            lim = _coerce_limit(args.get("limit"), default=50, cap=200)
+            if use_sb:
+                result = _products_without_stock_days_from_supabase(days, lim)
+            else:
+                result = _stub_products_without_stock_days(days, lim)
         else:
             return json.dumps({"error": f"tool desconocida: {name}"})
         return json.dumps(result, ensure_ascii=False)
