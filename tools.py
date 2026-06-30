@@ -30,10 +30,10 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_sales_summary",
             "description": (
-                "Obtiene un resumen agregado de ventas (totales) para un rango YYYY-MM-DD. "
-                "NO devuelve el detalle de cada orden. "
-                "Para listar órdenes de venta usar list_sales_orders. "
-                "Usar cuando pregunten por facturación total del período, montos sumados."
+                "Obtiene SOLO un resumen numérico agregado de ventas (total $, cantidad de documentos) para un rango YYYY-MM-DD. "
+                "NO devuelve clientes, NO devuelve órdenes individuales, NO devuelve detalle. "
+                "Usar ÚNICAMENTE cuando pregunten el total facturado, el monto total vendido en el período, KPIs de facturación. "
+                "NO usar cuando pregunten 'ventas del día', 'qué se vendió hoy', 'listado de ventas': para eso usar list_sales_orders."
             ),
             "parameters": {
                 "type": "object",
@@ -56,11 +56,11 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "list_sales_orders",
             "description": (
-                "Lista órdenes de venta (número, fecha, total, estado, etc.) en un rango de fechas. "
-                "Acepta filtro opcional por cliente (nombre o UUID). "
-                "Si el usuario menciona un cliente específico, pasar customer_name. "
-                "Si pide 'todas las ventas' o 'todo el detalle' sin filtro temporal, NO llamar: pedirle al usuario que acoter el período. "
-                "Usar cuando pregunten qué órdenes hay, pedidos de venta, OV, listado de ventas, ventas de un cliente."
+                "Lista órdenes de venta con cliente, monto y estado para un rango de fechas. "
+                "Usar cuando pregunten: 'ventas del día', 'qué se vendió hoy', 'ventas de hoy', 'listado de ventas', "
+                "'órdenes de venta', 'pedidos del día', 'OV', ventas de un cliente específico. "
+                "Acepta filtro opcional por cliente (customer_name). "
+                "Si pide 'todas las ventas' o 'todo el detalle' sin filtro temporal, NO llamar: pedirle al usuario que acote el período."
             ),
             "parameters": {
                 "type": "object",
