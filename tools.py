@@ -1293,7 +1293,7 @@ def _profiles_table() -> str:
 
 
 def _profiles_id_col() -> str:
-    return (os.environ.get("ERP_SUPABASE_PROFILES_ID_COL") or "id").strip() or "id"
+    return (os.environ.get("ERP_SUPABASE_PROFILES_ID_COL") or "user_id").strip() or "user_id"
 
 
 def _profiles_name_col() -> str:
