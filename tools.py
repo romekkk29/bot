@@ -675,10 +675,12 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_top_sellers",
             "description": (
-                "Devuelve el ranking de vendedores por órdenes de venta en un rango de fechas. "
-                "Usar cuando pregunten: 'vendedor con más ventas', 'ranking de vendedores', 'top vendedores', "
-                "'quién vendió más', 'ventas por vendedor', 'mejor vendedor del mes'. "
-                "Agrupa por vendedor (created_by en sales_orders) sumando monto total o contando órdenes."
+                "Ranking de vendedores basado en ÓRDENES DE VENTA (sales_orders) — NO en facturas. "
+                "Incluye ventas pendientes, en proceso y entregadas. "
+                "Usar SOLO cuando pregunten por: 'órdenes de venta por vendedor', 'quien hizo más órdenes', "
+                "'ranking de ventas' (en términos de pedidos/órdenes), 'mejor vendedor por órdenes'. "
+                "NO usar si el usuario pide 'facturación real', 'quién más facturó' o 'facturas emitidas': "
+                "para eso usar get_top_sellers_by_invoicing."
             ),
             "parameters": {
                 "type": "object",
@@ -694,6 +696,41 @@ TOOLS: list[dict[str, Any]] = [
                     "metric": {
                         "type": "string",
                         "description": "Métrica de ranking: 'monto' (suma total_amount, default) o 'cantidad' (conteo de órdenes)",
+                    },
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Máximo de vendedores a devolver (default 10, máx 50)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_top_sellers_by_invoicing",
+            "description": (
+                "Ranking de vendedores basado en FACTURACIÓN REAL (customer_invoices: FA, FB, remito). "
+                "Solo incluye comprobantes ya emitidos (productos facturados, en camino o entregados). "
+                "Usar cuando pregunten: 'quién más facturó', 'vendedor con mayor facturación', "
+                "'ranking por facturas emitidas', 'facturación real por vendedor'. "
+                "NO usar para órdenes de venta pendientes: para eso usar get_top_sellers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio inclusive YYYY-MM-DD (opcional; se infiere si falta)",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin inclusive YYYY-MM-DD (opcional; default hoy)",
+                    },
+                    "metric": {
+                        "type": "string",
+                        "description": "Métrica: 'monto' (suma total_amount, default) o 'cantidad' (conteo de facturas)",
                     },
                     "limit": {
                         "anyOf": [{"type": "integer"}, {"type": "string"}],
@@ -1298,6 +1335,20 @@ def _profiles_id_col() -> str:
 
 def _profiles_name_col() -> str:
     return (os.environ.get("ERP_SUPABASE_PROFILES_NAME_COL") or "full_name").strip() or "full_name"
+
+
+def _invoices_seller_col() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICES_SELLER_COL") or "created_by").strip() or "created_by"
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICES_SELLER_COL inválida: {c!r}")
+    return c
+
+
+def _invoices_amount_col() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICES_AMOUNT_COL") or "total_amount").strip() or "total_amount"
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICES_AMOUNT_COL inválida: {c!r}")
+    return c
 
 
 def _resolve_orders_list_dates(desde_raw: Any, hasta_raw: Any) -> tuple[str, str]:
@@ -3004,6 +3055,92 @@ def _recent_product_movements_from_supabase(query: str, days: int, limit: int) -
     }
 
 
+def _stub_top_sellers_by_invoicing(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
+    demo = [
+        {"user_id": "demo-user-1", "nombre": "Ana Gómez", "total_facturado": 720000.0, "cantidad_facturas": 10},
+        {"user_id": "demo-user-2", "nombre": "Carlos Pérez", "total_facturado": 580000.0, "cantidad_facturas": 8},
+        {"user_id": "demo-user-3", "nombre": "María López", "total_facturado": 390000.0, "cantidad_facturas": 6},
+    ]
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "metrica": metric,
+        "top_vendedores": demo[:limit],
+        "cantidad_devuelta": min(len(demo), limit),
+        "limite": limit,
+        "fuente": "stub",
+        "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para leer Postgres",
+    }
+
+
+def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _invoices_table()
+    date_c = _invoices_date_column()
+    seller_c = _invoices_seller_col()
+    amount_c = _invoices_amount_col()
+
+    page = 1000
+    start = 0
+    agg: dict[Any, dict[str, float]] = {}
+
+    while True:
+        r = (
+            client.table(table)
+            .select(f"{seller_c},{amount_c}")
+            .gte(date_c, desde)
+            .lte(date_c, hasta)
+            .range(start, start + page - 1)
+            .execute()
+        )
+        rows: list[dict[str, Any]] = r.data or []
+        for row in rows:
+            sid = row.get(seller_c)
+            if sid is None:
+                continue
+            cur = agg.setdefault(sid, {"total_facturado": 0.0, "cantidad_facturas": 0})
+            cur["total_facturado"] += _to_float(row.get(amount_c))
+            cur["cantidad_facturas"] += 1
+        if len(rows) < page:
+            break
+        start += page
+        if start > 500_000:
+            break
+
+    profiles_t = _profiles_table()
+    pid_c = _profiles_id_col()
+    pname_c = _profiles_name_col()
+    seller_ids = list(agg.keys())
+    names: dict[Any, str] = {}
+    if seller_ids:
+        for i in range(0, len(seller_ids), 200):
+            chunk = seller_ids[i : i + 200]
+            r = client.table(profiles_t).select(f"{pid_c},{pname_c}").in_(pid_c, chunk).execute()
+            for prow in r.data or []:
+                names[prow.get(pid_c)] = str(prow.get(pname_c) or "")
+
+    sort_key = "total_facturado" if metric != "cantidad" else "cantidad_facturas"
+    ranked = sorted(agg.items(), key=lambda kv: -kv[1][sort_key])
+    out: list[dict[str, Any]] = []
+    for sid, vals in ranked[:limit]:
+        out.append({
+            "user_id": sid,
+            "nombre": names.get(sid) or str(sid),
+            "total_facturado": round(vals["total_facturado"], 2),
+            "cantidad_facturas": vals["cantidad_facturas"],
+        })
+
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "metrica": metric,
+        "top_vendedores": out,
+        "cantidad_devuelta": len(out),
+        "limite": limit,
+        "fuente": "supabase",
+        "tabla": table,
+    }
+
+
 def _stub_top_sellers(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
     demo = [
         {"user_id": "demo-user-1", "nombre": "Ana Gómez", "total_monto": 850000.0, "cantidad_ordenes": 12},
@@ -3397,6 +3534,19 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _top_sellers_from_supabase(desde, hasta, metric, lim)
             else:
                 result = _stub_top_sellers(desde, hasta, metric, lim)
+        elif name == "get_top_sellers_by_invoicing":
+            lim = _coerce_limit(args.get("limit"), default=10, cap=50)
+            metric = str(args.get("metric") or "monto").strip().lower()
+            if metric not in ("monto", "cantidad"):
+                metric = "monto"
+            try:
+                desde, hasta = _resolve_orders_list_dates(args.get("desde"), args.get("hasta"))
+            except ValueError as e:
+                return json.dumps({"error": str(e)}, ensure_ascii=False)
+            if use_sb:
+                result = _top_sellers_by_invoicing_from_supabase(desde, hasta, metric, lim)
+            else:
+                result = _stub_top_sellers_by_invoicing(desde, hasta, metric, lim)
         else:
             return json.dumps({"error": f"tool desconocida: {name}"})
         return json.dumps(result, ensure_ascii=False)

@@ -80,7 +80,8 @@ CONCEPTO CLAVE — Ventas vs Facturación:
 "Ventas" son órdenes de venta (sales_orders): registradas por vendedores, pueden estar pendientes de facturación o entrega.
 "Facturación" son comprobantes emitidos (customer_invoices): FA, FB o remito; representan productos ya facturados, en camino o entregados físicamente.
 Los gráficos y reportes del sistema se basan en facturación, no en órdenes de venta.
-Cuando respondas sobre ventas usando órdenes de venta, aclará al usuario que esos datos pueden incluir ventas aún no facturadas."""
+Cuando respondas sobre ventas usando órdenes de venta, aclará al usuario que esos datos pueden incluir ventas aún no facturadas.
+Los montos de facturación (customer_invoices) NO descuentan notas de crédito emitidas. Cuando respondas con datos de facturación, aclará al usuario que el monto no considera las notas de crédito."""
 
 
 def _assistant_message_to_dict(msg) -> dict:
