@@ -172,6 +172,7 @@ processed_ids: set[str] = set()
 
 # Máximo de mensajes (sin contar system prompt) a mantener por conversación
 MAX_HISTORY_TURNS = int(os.environ.get("MAX_HISTORY_TURNS", "6"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "1000"))
 
 # Máximo de caracteres por resultado de tool (evita payloads enormes de Supabase)
 MAX_TOOL_OUTPUT_CHARS = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "3000"))
@@ -214,7 +215,13 @@ Si el usuario pregunta qué herramientas tenés, qué APIs usás, cómo estás c
 REGLA CRÍTICA — consultas sin filtro:
 Si el usuario pide "todas las ventas", "todo el detalle", "todos los productos", "todos los clientes" u otra consulta masiva SIN un filtro concreto (fecha, nombre, período, estado), NO ejecutes la herramienta.
 En cambio, respondé explicando qué filtros podés aplicar y pedí al menos uno. Ejemplos de filtros válidos: rango de fechas, nombre de producto/proveedor/cliente, estado de orden, o un período como 'hoy', 'esta semana', 'este mes'.
-Sí podés hacer consultas de resumen/totales o conteos sin filtro de fecha, ya que no devuelven filas individuales."""
+Sí podés hacer consultas de resumen/totales o conteos sin filtro de fecha, ya que no devuelven filas individuales.
+
+CONCEPTO CLAVE — Ventas vs Facturación:
+"Ventas" son órdenes de venta (sales_orders): registradas por vendedores, pueden estar pendientes de facturación o entrega.
+"Facturación" son comprobantes emitidos (customer_invoices): FA, FB o remito; representan productos ya facturados, en camino o entregados físicamente.
+Los gráficos y reportes del sistema se basan en facturación, no en órdenes de venta.
+Cuando respondas sobre ventas usando órdenes de venta, aclará al usuario que esos datos pueden incluir ventas aún no facturadas."""
 
 
 def _assistant_message_to_dict(msg) -> dict:
@@ -378,9 +385,12 @@ def run_turn(messages: list[dict]) -> str:
             tools=TOOLS,
             tool_choice="auto",
             temperature=0.2,
+            max_tokens=MAX_OUTPUT_TOKENS,
         )
         choice = response.choices[0]
         msg = choice.message
+        if not msg.tool_calls and not (msg.content or "").strip():
+            print(f"[run_turn] finish_reason={choice.finish_reason!r} content={msg.content!r}", file=sys.stderr)
 
         if msg.tool_calls:
             messages.append(_assistant_message_to_dict(msg))
@@ -663,6 +673,9 @@ async def api_chat(req: ChatRequest, request: Request):
         conversation_history[session_key] = system_msgs + non_system
 
         reply = run_turn(list(conversation_history[session_key]))
+        if not reply or not reply.strip():
+            print(f"[API/CHAT WARNING] run_turn devolvió respuesta vacía. session={session_key!r} msg={req.message!r}", file=sys.stderr)
+            reply = "No pude generar una respuesta para esta consulta. Por favor intentá reformularla o consultá con el administrador."
         conversation_history[session_key].append({"role": "assistant", "content": reply})
 
     except Exception as e:
