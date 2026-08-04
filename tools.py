@@ -678,7 +678,8 @@ TOOLS: list[dict[str, Any]] = [
                 "Ranking de vendedores basado en ÓRDENES DE VENTA (sales_orders) — NO en facturas. "
                 "Incluye ventas pendientes, en proceso y entregadas. "
                 "Usar SOLO cuando pregunten por: 'órdenes de venta por vendedor', 'quien hizo más órdenes', "
-                "'ranking de ventas' (en términos de pedidos/órdenes), 'mejor vendedor por órdenes'. "
+                "'ranking de ventas' (en términos de pedidos/órdenes), 'mejor vendedor por órdenes', 'ventas de un vendedor'. "
+                "Si el usuario nombra un vendedor específico, usar limit alto (hasta 50) para poder ubicarlo en el ranking. "
                 "NO usar si el usuario pide 'facturación real', 'quién más facturó' o 'facturas emitidas': "
                 "para eso usar get_top_sellers_by_invoicing."
             ),
@@ -714,7 +715,8 @@ TOOLS: list[dict[str, Any]] = [
                 "Ranking de vendedores basado en FACTURACIÓN REAL (customer_invoices: FA, FB, remito). "
                 "Solo incluye comprobantes ya emitidos (productos facturados, en camino o entregados). "
                 "Usar cuando pregunten: 'quién más facturó', 'vendedor con mayor facturación', "
-                "'ranking por facturas emitidas', 'facturación real por vendedor'. "
+                "'ranking por facturas emitidas', 'facturación real por vendedor', 'facturación de un vendedor'. "
+                "Si el usuario nombra un vendedor específico, usar limit alto (hasta 50) para poder ubicarlo en el ranking. "
                 "NO usar para órdenes de venta pendientes: para eso usar get_top_sellers."
             ),
             "parameters": {
