@@ -3077,36 +3077,83 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     assert client is not None
     table = _invoices_table()
     date_c = _invoices_date_column()
-    seller_c = _invoices_seller_col()
     amount_c = _invoices_amount_col()
+    orders_table = _orders_list_table()
+    seller_col = _orders_seller_col()
 
+    # Paso 1: IDs que son destino de conversión (ci.id NOT IN converted_to_invoice_id)
+    try:
+        excl_r = (
+            client.table(table)
+            .select("converted_to_invoice_id")
+            .not_.is_("converted_to_invoice_id", "null")
+            .limit(10000)
+            .execute()
+        )
+        excluded_ids: set[str] = {
+            row["converted_to_invoice_id"]
+            for row in (excl_r.data or [])
+            if row.get("converted_to_invoice_id")
+        }
+    except Exception:
+        excluded_ids = set()
+
+    # Paso 2: paginar facturas con filtros de fecha y estado
+    excluded_statuses = ["cancelled", "voided", "converted", "draft"]
+    excluded_types = {"nota_pedido", "np"}
     page = 1000
     start = 0
-    agg: dict[Any, dict[str, float]] = {}
+    inv_rows: list[dict[str, Any]] = []
 
     while True:
         r = (
             client.table(table)
-            .select(f"{seller_c},{amount_c}")
+            .select(f"id,{amount_c},created_by,sales_order_id,warehouse_id,payment_condition,invoice_type")
             .gte(date_c, desde)
             .lte(date_c, hasta)
+            .not_.in_("status", excluded_statuses)
             .range(start, start + page - 1)
             .execute()
         )
         rows: list[dict[str, Any]] = r.data or []
         for row in rows:
-            sid = row.get(seller_c)
-            if sid is None:
+            if row.get("id") in excluded_ids:
                 continue
-            cur = agg.setdefault(sid, {"total_facturado": 0.0, "cantidad_facturas": 0})
-            cur["total_facturado"] += _to_float(row.get(amount_c))
-            cur["cantidad_facturas"] += 1
+            inv_type = (row.get("invoice_type") or "").lower()
+            if inv_type in excluded_types:
+                continue
+            if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
+                continue
+            inv_rows.append(row)
         if len(rows) < page:
             break
         start += page
         if start > 500_000:
             break
 
+    # Paso 3: resolver so.created_by para facturas con sales_order_id (COALESCE)
+    so_seller: dict[str, str] = {}
+    so_ids = list({row["sales_order_id"] for row in inv_rows if row.get("sales_order_id")})
+    if so_ids:
+        for i in range(0, len(so_ids), 200):
+            chunk = so_ids[i : i + 200]
+            r = client.table(orders_table).select(f"id,{seller_col}").in_("id", chunk).execute()
+            for srow in r.data or []:
+                if srow.get(seller_col):
+                    so_seller[srow["id"]] = srow[seller_col]
+
+    # Paso 4: agregar por vendedor efectivo → COALESCE(so.created_by, ci.created_by)
+    agg: dict[Any, dict[str, float]] = {}
+    for row in inv_rows:
+        so_id = row.get("sales_order_id")
+        sid = (so_id and so_seller.get(so_id)) or row.get("created_by")
+        if sid is None:
+            continue
+        cur = agg.setdefault(sid, {"total_facturado": 0.0, "cantidad_facturas": 0})
+        cur["total_facturado"] += _to_float(row.get(amount_c))
+        cur["cantidad_facturas"] += 1
+
+    # Paso 5: resolver nombres desde profiles
     profiles_t = _profiles_table()
     pid_c = _profiles_id_col()
     pname_c = _profiles_name_col()
