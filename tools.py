@@ -152,6 +152,37 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_least_selling_products",
+            "description": (
+                "Obtiene ranking de productos menos vendidos en un rango de fechas a partir de líneas de venta. "
+                "Devuelve productos con menor cantidad y monto vendido."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio inclusive YYYY-MM-DD (opcional; si falta se infiere)",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin inclusive YYYY-MM-DD (opcional; default hoy)",
+                    },
+                    "limit": {
+                        "anyOf": [
+                            {"type": "integer"},
+                            {"type": "string"},
+                        ],
+                        "description": "Máximo de productos en el ranking (default 10, máx 100)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_purchase_summary",
             "description": (
                 "Resumen agregado de compras (suma totales de órdenes de compra) entre dos fechas YYYY-MM-DD. "
@@ -2132,6 +2163,142 @@ def _top_selling_products_from_supabase(desde: str, hasta: str, limit: int) -> d
     }
 
 
+def _stub_least_selling_products(desde: str, hasta: str, limit: int) -> dict[str, Any]:
+    demo = [
+        {
+            "product_id": "demo-prod-3",
+            "sku_o_codigo": "SKU-003",
+            "nombre": "Producto demo C",
+            "cantidad_vendida": 2.0,
+            "monto_vendido": 1500.0,
+        },
+        {
+            "product_id": "demo-prod-4",
+            "sku_o_codigo": "SKU-004",
+            "nombre": "Producto demo D",
+            "cantidad_vendida": 5.0,
+            "monto_vendido": 4000.0,
+        },
+    ]
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "productos_menos_vendidos": demo[:limit],
+        "cantidad_devuelta": min(len(demo), limit),
+        "limite": limit,
+        "fuente": "stub",
+        "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para leer Postgres",
+    }
+
+
+def _least_selling_products_from_supabase(desde: str, hasta: str, limit: int) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    items_t, amount_c, fk_c, orders_t, date_c, oid_c = _sales_items_column_config()
+    product_c, qty_c = _sales_items_top_columns()
+
+    page = 1000
+    start = 0
+    order_ids: list[Any] = []
+    while True:
+        r = (
+            client.table(orders_t)
+            .select(oid_c)
+            .gte(date_c, desde)
+            .lte(date_c, hasta)
+            .range(start, start + page - 1)
+            .execute()
+        )
+        rows = r.data or []
+        for row in rows:
+            oid = row.get(oid_c)
+            if oid is not None:
+                order_ids.append(oid)
+        if len(rows) < page:
+            break
+        start += page
+        if start > 500_000:
+            break
+
+    order_ids = list(dict.fromkeys(order_ids))
+    if not order_ids:
+        return {
+            "periodo": {"desde": desde, "hasta": hasta},
+            "productos_menos_vendidos": [],
+            "cantidad_devuelta": 0,
+            "limite": limit,
+            "fuente": "supabase",
+            "tabla_items": items_t,
+        }
+
+    try:
+        chunk_sz = int(os.environ.get("ERP_SUPABASE_SALES_ITEMS_ORDER_ID_CHUNK", "80") or "80")
+    except ValueError:
+        chunk_sz = 80
+    chunk_sz = max(1, min(chunk_sz, 200))
+
+    agg: dict[Any, dict[str, float]] = {}
+    for i in range(0, len(order_ids), chunk_sz):
+        chunk = order_ids[i : i + chunk_sz]
+        i_start = 0
+        while True:
+            r = (
+                client.table(items_t)
+                .select(f"{product_c},{qty_c},{amount_c}")
+                .in_(fk_c, chunk)
+                .range(i_start, i_start + page - 1)
+                .execute()
+            )
+            rows = r.data or []
+            for row in rows:
+                pid = row.get(product_c)
+                if pid is None:
+                    continue
+                cur = agg.setdefault(pid, {"cantidad_vendida": 0.0, "monto_vendido": 0.0})
+                cur["cantidad_vendida"] += _to_float(row.get(qty_c))
+                cur["monto_vendido"] += _to_float(row.get(amount_c))
+            if len(rows) < page:
+                break
+            i_start += page
+            if i_start > 500_000:
+                break
+
+    ids = list(agg.keys())
+    code_c, name_c, _, uuid_c = _product_table_columns()
+    by_id: dict[Any, dict[str, Any]] = {}
+    if uuid_c and ids:
+        for i in range(0, len(ids), 200):
+            chunk = ids[i : i + 200]
+            r = client.table(_products_table()).select(f"{uuid_c},{code_c},{name_c}").in_(uuid_c, chunk).execute()
+            for prow in r.data or []:
+                by_id[prow.get(uuid_c)] = prow
+
+    ranked = sorted(
+        agg.items(),
+        key=lambda kv: (kv[1]["cantidad_vendida"], kv[1]["monto_vendido"]),
+    )
+    out: list[dict[str, Any]] = []
+    for pid, vals in ranked[:limit]:
+        p = by_id.get(pid, {})
+        out.append(
+            {
+                "product_id": pid,
+                "sku_o_codigo": p.get(code_c),
+                "nombre": p.get(name_c),
+                "cantidad_vendida": round(vals["cantidad_vendida"], 3),
+                "monto_vendido": round(vals["monto_vendido"], 2),
+            }
+        )
+
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "productos_menos_vendidos": out,
+        "cantidad_devuelta": len(out),
+        "limite": limit,
+        "fuente": "supabase",
+        "tabla_items": items_t,
+    }
+
+
 def _stub_purchase_summary(desde: str, hasta: str) -> dict[str, Any]:
     return {
         "periodo": {"desde": desde, "hasta": hasta},
@@ -3374,6 +3541,19 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _top_selling_products_from_supabase(desde, hasta, lim)
             else:
                 result = _stub_top_selling_products(desde, hasta, lim)
+        elif name == "get_least_selling_products":
+            lim = _coerce_limit(args.get("limit"), default=10, cap=100)
+            try:
+                desde, hasta = _resolve_orders_list_dates(
+                    args.get("desde"),
+                    args.get("hasta"),
+                )
+            except ValueError as e:
+                return json.dumps({"error": str(e)}, ensure_ascii=False)
+            if use_sb:
+                result = _least_selling_products_from_supabase(desde, hasta, lim)
+            else:
+                result = _stub_least_selling_products(desde, hasta, lim)
         elif name == "get_purchase_summary":
             desde, hasta = str(args["desde"]), str(args["hasta"])
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", desde) or not re.fullmatch(
