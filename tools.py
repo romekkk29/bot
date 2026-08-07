@@ -776,8 +776,6 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
-_supabase_client: Any | None = None
-
 # ContextVar para override por request (multi-tenant, async-safe)
 _request_supabase_override: ContextVar[Any | None] = ContextVar("_request_supabase_override", default=None)
 
@@ -786,39 +784,12 @@ _supabase_client_by_key: dict[str, Any] = {}
 
 
 def data_backend_label() -> str:
-    if _request_supabase_override.get() is not None:
-        return "supabase"
-    if _supabase_credentials():
-        return "supabase"
-    return "stub"
-
-
-def _supabase_credentials() -> tuple[str, str] | None:
-    url = os.environ.get("SUPABASE_URL", "").strip()
-    key = (
-        os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-        or os.environ.get("SUPABASE_KEY", "").strip()
-    )
-    if url and key:
-        return (url, key)
-    return None
+    return "supabase" if _request_supabase_override.get() is not None else "stub"
 
 
 def _get_supabase():
-    # Primero: override por request (multi-tenant)
-    override = _request_supabase_override.get()
-    if override is not None:
-        return override
-    # Fallback: cliente global singleton
-    global _supabase_client
-    creds = _supabase_credentials()
-    if not creds:
-        return None
-    if _supabase_client is None:
-        from supabase import create_client
-        url, key = creds
-        _supabase_client = create_client(url, key)
-    return _supabase_client
+    """Solo devuelve el cliente si se seteó un override vía set_request_supabase()."""
+    return _request_supabase_override.get()
 
 
 def _get_supabase_for_key(db_key: str) -> Any | None:
@@ -1289,6 +1260,17 @@ def _coerce_limit(raw: Any, default: int = 10, cap: int = 500) -> int:
     else:
         return default
     return max(1, min(n, cap))
+
+
+def _date_range_bounds(desde: str, hasta: str) -> tuple[str, str]:
+    """Si recibimos YYYY-MM-DD, cubrimos todo el día (00:00:00 a 23:59:59.999999).
+
+    Esto evita que un campo `timestamp` con hora real nos deje afuera los
+    comprobantes generados después de la medianoche del día consultado.
+    """
+    desde_filtro = f"{desde}T00:00:00" if len(desde) == 10 and "T" not in desde else desde
+    hasta_filtro = f"{hasta}T23:59:59.999999" if len(hasta) == 10 and "T" not in hasta else hasta
+    return desde_filtro, hasta_filtro
 
 
 def _like_token(q: str, max_len: int = 80) -> str:
@@ -1794,7 +1776,8 @@ def _list_customer_invoices_from_supabase(
     customer_id_c = _invoices_customer_id_column()
     select_cols = _invoices_select_expr()
     lim = max(1, min(limit, 200))
-    q = client.table(table).select(select_cols).gte(date_c, desde).lte(date_c, hasta)
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+    q = client.table(table).select(select_cols).gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
     if filter_customer_id:
         q = q.eq(customer_id_c, filter_customer_id)
     if filter_status:
@@ -1821,9 +1804,10 @@ def _get_invoice_summary_from_supabase(
     table = _invoices_table()
     date_c = _invoices_date_column()
     customer_id_c = _invoices_customer_id_column()
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
     q = client.table(table).select(
         "total_amount,paid_amount,remaining_amount,status"
-    ).gte(date_c, desde).lte(date_c, hasta)
+    ).gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
     if filter_customer_id:
         q = q.eq(customer_id_c, filter_customer_id)
     r = q.limit(5000).execute()
@@ -2315,7 +2299,8 @@ def _purchase_summary_from_supabase(desde: str, hasta: str) -> dict[str, Any]:
     table = _purchase_orders_table()
     date_c = _po_date_column()
     amount_c = _po_amount_column()
-    r = client.table(table).select(amount_c).gte(date_c, desde).lte(date_c, hasta).execute()
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+    r = client.table(table).select(amount_c).gte(date_c, desde_filtro).lte(date_c, hasta_filtro).execute()
     rows: list[dict[str, Any]] = r.data or []
     total = 0.0
     for row in rows:
@@ -2632,7 +2617,8 @@ def _stub_products(query: str, limit: int) -> dict[str, Any]:
 def _sales_from_supabase_orders(client: Any, desde: str, hasta: str) -> dict[str, Any]:
     table, date_c, amount_c = _sales_orders_column_config()
     q = client.table(table).select(amount_c)
-    r = q.gte(date_c, desde).lte(date_c, hasta).execute()
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+    r = q.gte(date_c, desde_filtro).lte(date_c, hasta_filtro).execute()
     rows: list[dict[str, Any]] = r.data or []
     total = 0.0
     for row in rows:
@@ -2657,7 +2643,8 @@ def _sales_from_supabase_items(client: Any, desde: str, hasta: str) -> dict[str,
     start = 0
     order_ids: list[Any] = []
     while True:
-        oq = client.table(orders_t).select(oid_c).gte(date_c, desde).lte(date_c, hasta)
+        desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+        oq = client.table(orders_t).select(oid_c).gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
         orow = oq.range(start, start + page - 1).execute()
         batch = orow.data or []
         for row in batch:
@@ -3251,21 +3238,30 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     seller_col = _orders_seller_col()
 
     # Paso 1: IDs que son destino de conversión (ci.id NOT IN converted_to_invoice_id)
+    page = 1000
+    excluded_ids: set[str] = set()
     try:
-        excl_r = (
-            client.table(table)
-            .select("converted_to_invoice_id")
-            .not_.is_("converted_to_invoice_id", "null")
-            .limit(10000)
-            .execute()
-        )
-        excluded_ids: set[str] = {
-            row["converted_to_invoice_id"]
-            for row in (excl_r.data or [])
-            if row.get("converted_to_invoice_id")
-        }
+        excl_start = 0
+        while True:
+            excl_r = (
+                client.table(table)
+                .select("converted_to_invoice_id")
+                .not_.is_("converted_to_invoice_id", "null")
+                .order("id")
+                .range(excl_start, excl_start + page - 1)
+                .execute()
+            )
+            excl_rows = excl_r.data or []
+            for row in excl_rows:
+                if row.get("converted_to_invoice_id"):
+                    excluded_ids.add(row["converted_to_invoice_id"])
+            if len(excl_rows) < page:
+                break
+            excl_start += page
+            if excl_start > 500_000:
+                break
     except Exception:
-        excluded_ids = set()
+        pass
 
     # Paso 2: paginar facturas con filtros de fecha y estado
     excluded_statuses = ["cancelled", "voided", "converted", "draft"]
@@ -3274,13 +3270,15 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     start = 0
     inv_rows: list[dict[str, Any]] = []
 
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
     while True:
         r = (
             client.table(table)
             .select(f"id,{amount_c},created_by,sales_order_id,warehouse_id,payment_condition,invoice_type")
-            .gte(date_c, desde)
-            .lte(date_c, hasta)
+            .gte(date_c, desde_filtro)
+            .lte(date_c, hasta_filtro)
             .not_.in_("status", excluded_statuses)
+            .order("id")
             .range(start, start + page - 1)
             .execute()
         )
@@ -3290,8 +3288,6 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
                 continue
             inv_type = (row.get("invoice_type") or "").lower()
             if inv_type in excluded_types:
-                continue
-            if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
                 continue
             inv_rows.append(row)
         if len(rows) < page:

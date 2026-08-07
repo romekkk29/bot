@@ -13,7 +13,13 @@ from dotenv import load_dotenv
 from groq import Groq
 from openai import OpenAI
 
-from tools import TOOLS, data_backend_label, dispatch_tool
+from tools import (
+    TOOLS,
+    data_backend_label,
+    dispatch_tool,
+    _get_supabase_for_key,
+    set_request_supabase,
+)
 
 MAX_TOOL_OUTPUT_CHARS = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "2000"))
 MAX_INPUT_TOKENS = int(os.environ.get("MAX_INPUT_TOKENS", "6000"))
@@ -271,6 +277,11 @@ def run_turn(client: OpenAI | Groq, model: str, messages: list[dict], tools: lis
 
 def main() -> None:
     load_dotenv()
+
+    db_key = os.environ.get("SUPABASE_DB_KEY", "ALPINA_PROD").strip().upper()
+    sb_client = _get_supabase_for_key(db_key)
+    if sb_client:
+        set_request_supabase(sb_client)
 
     provider = os.environ.get("LLM_PROVIDER", "groq").strip().lower()
 
