@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from groq import Groq
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from tools import (
@@ -33,23 +34,38 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
 WHATSAPP_API_KEY = os.environ.get("WHATSAPP_API_KEY")
 WHATSAPP_API_URL = os.environ.get("WHATSAPP_API_URL", "https://api.kapso.ai/meta/whatsapp/v24.0")
+
+openai_client: OpenAI | None = None
 
 if LLM_PROVIDER == "gemini":
     if not GEMINI_API_KEY:
         print("ERROR: Definí GEMINI_API_KEY en .env", file=sys.stderr)
         sys.exit(1)
     client: Any = None
+    openai_client = None
     print(f"[LLM] Usando Gemini ({GEMINI_MODEL})", file=sys.stderr)
 elif LLM_PROVIDER == "ollama":
     client = None
+    openai_client = None
     print(f"[LLM] Usando Ollama local ({OLLAMA_MODEL}) → {OLLAMA_BASE_URL}", file=sys.stderr)
+elif LLM_PROVIDER == "openai":
+    if not OPENAI_API_KEY:
+        print("ERROR: Definí OPENAI_API_KEY en .env", file=sys.stderr)
+        sys.exit(1)
+    client = None
+    openai_client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL or None)
+    print(f"[LLM] Usando OpenAI ({OPENAI_MODEL})", file=sys.stderr)
 else:
     if not GROQ_API_KEY:
         print("ERROR: Definí GROQ_API_KEY en .env", file=sys.stderr)
         sys.exit(1)
     client = Groq(api_key=GROQ_API_KEY)
+    openai_client = None
     print(f"[LLM] Usando Groq ({GROQ_MODEL})", file=sys.stderr)
 
 # Inicializar FastAPI
@@ -326,6 +342,44 @@ def _run_turn_ollama(messages: list[dict]) -> str:
         return (msg.content or "").strip()
 
 
+def _run_turn_openai(messages: list[dict]) -> str:
+    """Run one conversational turn using the OpenAI API."""
+    while True:
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=0.2,
+            max_tokens=MAX_OUTPUT_TOKENS,
+        )
+        choice = response.choices[0]
+        msg = choice.message
+
+        if not msg.tool_calls and not (msg.content or "").strip():
+            print(f"[OPENAI] finish_reason={choice.finish_reason!r} content={msg.content!r}", file=sys.stderr)
+
+        if msg.tool_calls:
+            messages.append(_assistant_message_to_dict(msg))
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                raw_args = tc.function.arguments or "{}"
+                output = dispatch_tool(name, raw_args)
+                if len(output) > MAX_TOOL_OUTPUT_CHARS:
+                    output = output[:MAX_TOOL_OUTPUT_CHARS] + "...[truncado]"
+                print(f"[OPENAI] tool: {name}({raw_args[:80]})", file=sys.stderr)
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": output,
+                    }
+                )
+            continue
+
+        return (msg.content or "").strip()
+
+
 def _run_turn_gemini(messages: list[dict]) -> str:
     """Run one conversational turn using the google-genai SDK."""
     from google import genai as _gg
@@ -379,6 +433,8 @@ def run_turn(messages: list[dict]) -> str:
         return _run_turn_gemini(messages)
     if LLM_PROVIDER == "ollama":
         return _run_turn_ollama(messages)
+    if LLM_PROVIDER == "openai":
+        return _run_turn_openai(messages)
     # Groq (OpenAI-compatible)
     while True:
         response = client.chat.completions.create(
@@ -460,6 +516,8 @@ async def root():
         model_label = GEMINI_MODEL
     elif LLM_PROVIDER == "ollama":
         model_label = OLLAMA_MODEL
+    elif LLM_PROVIDER == "openai":
+        model_label = OPENAI_MODEL
     else:
         model_label = GROQ_MODEL
     return {

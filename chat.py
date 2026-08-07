@@ -11,6 +11,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from groq import Groq
+from openai import OpenAI
 
 from tools import TOOLS, data_backend_label, dispatch_tool
 
@@ -234,7 +235,7 @@ def run_turn_ollama(base_url: str, model: str, messages: list[dict], tools: list
         return (msg.content or "").strip()
 
 
-def run_turn(client: Groq, model: str, messages: list[dict], tools: list = TOOLS) -> str:
+def run_turn(client: OpenAI | Groq, model: str, messages: list[dict], tools: list = TOOLS) -> str:
     messages = _trim_history(messages)
     total_in = total_out = 0
     while True:
@@ -279,7 +280,7 @@ def main() -> None:
             print("Definí GEMINI_API_KEY en .env.", file=sys.stderr)
             sys.exit(1)
         model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-        client: Groq | None = None
+        client: OpenAI | Groq | None = None
         label = f"Gemini ({model})"
     elif provider == "ollama":
         base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
@@ -287,6 +288,15 @@ def main() -> None:
         api_key = None
         client = None
         label = f"Ollama local ({model})"
+    elif provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            print("Definí OPENAI_API_KEY en .env.", file=sys.stderr)
+            sys.exit(1)
+        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        client = OpenAI(api_key=api_key, base_url=base_url or None)
+        label = f"OpenAI ({model})"
     else:
         api_key = os.environ.get("GROQ_API_KEY")
         if not api_key:
@@ -323,6 +333,8 @@ def main() -> None:
                 reply = run_turn_gemini(model, api_key, list(history), active_tools)
             elif provider == "ollama":
                 reply = run_turn_ollama(base_url, model, list(history), active_tools)
+            elif provider == "openai":
+                reply = run_turn(client, model, list(history), active_tools)
             else:
                 reply = run_turn(client, model, list(history), active_tools)
         except Exception as e:
