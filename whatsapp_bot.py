@@ -582,11 +582,14 @@ async def whatsapp_webhook(request: Request):
             return {"status": "ignored", "reason": "not text"}
 
         # Obtener o crear historial
+        user_info = _resolve_profile_by_phone(from_number)  # usa _profile_cache, no hay hit extra a la DB
         if from_number not in conversation_history:
-            user_info = _resolve_profile_by_phone(from_number)
             conversation_history[from_number] = [
                 {"role": "system", "content": _build_system_prompt(user_info)}
             ]
+        else:
+            # Actualizar la fecha del system prompt en cada turno
+            conversation_history[from_number][0] = {"role": "system", "content": _build_system_prompt(user_info)}
 
         conversation_history[from_number].append({"role": "user", "content": message_text})
 
@@ -648,6 +651,9 @@ async def direct_message(msg: WhatsAppMessage):
             conversation_history[msg.from_number] = [
                 {"role": "system", "content": _build_system_prompt()}
             ]
+        else:
+            # Actualizar la fecha del system prompt en cada turno
+            conversation_history[msg.from_number][0] = {"role": "system", "content": _build_system_prompt()}
         
         # Agregar mensaje del usuario
         conversation_history[msg.from_number].append({"role": "user", "content": msg.message})
@@ -730,6 +736,9 @@ async def api_chat(req: ChatRequest, request: Request):
             conversation_history[session_key] = [
                 {"role": "system", "content": _build_system_prompt(user_info)}
             ]
+        else:
+            # Actualizar la fecha del system prompt en cada turno
+            conversation_history[session_key][0] = {"role": "system", "content": _build_system_prompt(user_info)}
 
         conversation_history[session_key].append({"role": "user", "content": req.message})
 
