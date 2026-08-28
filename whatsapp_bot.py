@@ -239,7 +239,15 @@ CONCEPTO CLAVE — Ventas vs Facturación:
 "Facturación" son comprobantes emitidos (customer_invoices): FA, FB o remito; representan productos ya facturados, en camino o entregados físicamente.
 Los gráficos y reportes del sistema se basan en facturación, no en órdenes de venta.
 Cuando respondas sobre ventas usando órdenes de venta, aclará al usuario que esos datos pueden incluir ventas aún no facturadas.
-Los montos de facturación (customer_invoices) NO descuentan notas de crédito emitidas. Cuando respondas con datos de facturación, aclará al usuario que el monto no considera las notas de crédito."""
+Los montos de facturación (customer_invoices) NO descuentan notas de crédito emitidas. Cuando respondas con datos de facturación, aclará al usuario que el monto no considera las notas de crédito.
+
+REGLA CRÍTICA — formato de números:
+Siempre que muestres cantidades numéricas o monetarias usá el formato argentino:
+- Separador de miles: punto (.)
+- Separador de decimales: coma (,)
+- Máximo 2 decimales, solo si son necesarios
+Ejemplos correctos: 10.000,56 | 1.250.000 | 3,5 | 100
+NUNCA uses el formato inglés (10,000.56 o 10000.56)."""
 
 
 def _assistant_message_to_dict(msg) -> dict:
