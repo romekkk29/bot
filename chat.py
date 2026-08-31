@@ -89,7 +89,13 @@ CONCEPTO CLAVE — Ventas vs Facturación:
 "Facturación" son comprobantes emitidos (customer_invoices): FA, FB o remito; representan productos ya facturados, en camino o entregados físicamente.
 Los gráficos y reportes del sistema se basan en facturación, no en órdenes de venta.
 Cuando respondas sobre ventas usando órdenes de venta, aclará al usuario que esos datos pueden incluir ventas aún no facturadas.
-Los montos de facturación (customer_invoices) NO descuentan notas de crédito emitidas. Cuando respondas con datos de facturación, aclará al usuario que el monto no considera las notas de crédito."""
+Los montos de facturación (customer_invoices) NO descuentan notas de crédito emitidas. Cuando respondas con datos de facturación, aclará al usuario que el monto no considera las notas de crédito.
+
+REGLA CRÍTICA — resultados paginados / límite de filas:
+Cuando una herramienta devuelva `hay_mas: true`, SIEMPRE avisá al usuario al final de tu respuesta.
+Si la respuesta incluye `total_en_bd`, usá ese número: "Mostrando X de Y facturas del período."
+Si `total_en_bd` no está disponible, decí: "Es posible que existan más registros; la consulta está limitada a X resultados. Podés pedir más especificando un filtro o solicitando un límite mayor."
+Nunca omitas esta advertencia cuando `hay_mas` sea verdadero."""
 
 
 def _assistant_message_to_dict(msg) -> dict:

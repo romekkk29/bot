@@ -1777,22 +1777,42 @@ def _list_customer_invoices_from_supabase(
     select_cols = _invoices_select_expr()
     lim = max(1, min(limit, 200))
     desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
-    q = client.table(table).select(select_cols).gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
-    if filter_customer_id:
-        q = q.eq(customer_id_c, filter_customer_id)
-    if filter_status:
-        q = q.eq("status", filter_status)
-    r = q.order(date_c, desc=True).limit(lim).execute()
+    # Base query (reutilizada para count y para datos)
+    def _base_q():
+        bq = client.table(table).select(select_cols).gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
+        if filter_customer_id:
+            bq = bq.eq(customer_id_c, filter_customer_id)
+        if filter_status:
+            bq = bq.eq("status", filter_status)
+        return bq
+    # COUNT exacto para saber el total real en la base de datos
+    total_en_bd: int | None = None
+    try:
+        count_r = client.table(table).select("id", count="exact").gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
+        if filter_customer_id:
+            count_r = count_r.eq(customer_id_c, filter_customer_id)
+        if filter_status:
+            count_r = count_r.eq("status", filter_status)
+        count_r = count_r.execute()
+        total_en_bd = count_r.count
+    except Exception:
+        pass
+    r = _base_q().order(date_c, desc=True).limit(lim).execute()
     rows: list[dict[str, Any]] = r.data or []
     rows = _attach_customers_to_orders(rows, customer_id_c)
-    return {
+    hay_mas = (total_en_bd is not None and total_en_bd > len(rows)) or (total_en_bd is None and len(rows) >= lim)
+    result: dict[str, Any] = {
         "periodo": {"desde": desde, "hasta": hasta},
         "facturas": rows,
         "cantidad_devuelta": len(rows),
-        "limite": lim,
+        "limite_aplicado": lim,
+        "hay_mas": hay_mas,
         "fuente": "supabase",
         "tabla": table,
     }
+    if total_en_bd is not None:
+        result["total_en_bd"] = total_en_bd
+    return result
 
 
 def _get_invoice_summary_from_supabase(
