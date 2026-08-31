@@ -30,10 +30,11 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_sales_summary",
             "description": (
-                "Obtiene SOLO un resumen numérico agregado de ventas (total $, cantidad de documentos) para un rango YYYY-MM-DD. "
+                "Resumen numérico agregado de órdenes de venta (total $, cantidad de órdenes) para un rango YYYY-MM-DD. "
+                "SOLO para consultas específicas de órdenes de venta. "
                 "NO devuelve clientes, NO devuelve órdenes individuales, NO devuelve detalle. "
-                "Usar ÚNICAMENTE cuando pregunten el total facturado, el monto total vendido en el período, KPIs de facturación. "
-                "NO usar cuando pregunten 'ventas del día', 'qué se vendió hoy', 'listado de ventas': para eso usar list_sales_orders."
+                "PREFERIR get_invoice_summary cuando el usuario pregunte por 'ventas', 'total vendido', 'cuánto vendimos'. "
+                "Usar este solo si el usuario pide explícitamente resumen de 'órdenes de venta' o 'OV'."
             ),
             "parameters": {
                 "type": "object",
@@ -56,11 +57,11 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "list_sales_orders",
             "description": (
-                "Lista órdenes de venta con cliente, monto y estado para un rango de fechas. "
-                "Usar cuando pregunten: 'ventas del día', 'qué se vendió hoy', 'ventas de hoy', 'listado de ventas', "
-                "'órdenes de venta', 'pedidos del día', 'OV', ventas de un cliente específico. "
+                "Lista ÓRDENES DE VENTA (pedidos, OV) con cliente, monto y estado para un rango de fechas. "
+                "Usar SOLO cuando el usuario diga explícitamente: 'órdenes de venta', 'OV', 'pedidos del día', 'pedidos'. "
+                "NO usar si el usuario dice simplemente 'ventas' o 'qué se vendió': para eso usar list_customer_invoices. "
                 "Acepta filtro opcional por cliente (customer_name). "
-                "Si pide 'todas las ventas' o 'todo el detalle' sin filtro temporal, NO llamar: pedirle al usuario que acote el período."
+                "Si pide 'todas las órdenes' o 'todo el detalle' sin filtro temporal, NO llamar: pedirle al usuario que acote el período."
             ),
             "parameters": {
                 "type": "object",
@@ -534,9 +535,16 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "list_customer_invoices",
             "description": (
-                "Lista facturas de clientes (número, fecha, total, cobrado, saldo, estado) en un rango de fechas. "
+                "Lista facturas/ventas de clientes (número, fecha, total, cobrado, saldo, estado) en un rango de fechas. "
                 "Acepta filtro opcional por cliente (nombre o UUID) y/o estado. "
-                "Usar cuando pregunten por facturas, comprobantes emitidos, deuda de un cliente, facturas pendientes/vencidas."
+                "Usar SOLO cuando el usuario pida EXPLÍCITAMENTE un listado o detalle de facturas individuales: "
+                "'mostrá las ventas', 'listado de facturas', 'qué facturas hay', 'detalle de ventas', "
+                "'facturas pendientes/vencidas', 'ventas de un cliente específico', 'comprobantes emitidos'. "
+                "NO usar si el usuario solo pregunta cuánto se vendió, el total, o el monto del día/semana/mes: "
+                "para eso usar get_invoice_summary. "
+                "LÍMITE: pasar siempre limit=10 salvo que el usuario pida explícitamente más registros. "
+                "IMPORTANTE: 'ventas' para el usuario = facturación real (customer_invoices), NO órdenes de venta. "
+                "Excluye automáticamente: cancelled, voided, converted, draft y tipos nota_pedido/np."
             ),
             "parameters": {
                 "type": "object",
@@ -563,7 +571,7 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "limit": {
                         "anyOf": [{"type": "integer"}, {"type": "string"}],
-                        "description": "Máximo de facturas a devolver (default 30, máx 200)",
+                        "description": "Máximo de facturas a devolver. SIEMPRE usar 10 salvo que el usuario pida explícitamente más. Máx absoluto 200.",
                     },
                 },
                 "required": [],
@@ -575,10 +583,16 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_invoice_summary",
             "description": (
-                "Resumen agregado de facturación en un rango de fechas: total facturado, total cobrado, saldo pendiente, "
-                "cantidad de facturas y desglose por estado. "
+                "Resumen agregado de facturación/ventas: total facturado, total cobrado, saldo pendiente y cantidad de facturas. "
                 "Acepta filtro opcional por cliente. "
-                "Usar cuando pregunten cuánto facturamos, cuánto cobró un cliente, saldo total de deuda."
+                "Es la función PRINCIPAL para cualquier consulta de ventas sin pedir listado explícito. "
+                "Usar cuando pregunten: 'ventas de hoy', 'ventas del día', 'cuánto se vendió hoy', "
+                "'cuántas ventas hubo hoy', 'ventas de ayer', 'ventas de esta semana', 'ventas del mes', "
+                "'cuánto facturamos', 'total de ventas', 'monto total de ventas', "
+                "'cuánto vendimos', 'total vendido', 'cuánto cobró un cliente', 'saldo total de deuda', "
+                "'resumen de ventas', 'resumen de facturación'. "
+                "IMPORTANTE: 'ventas' para el usuario = facturación real (customer_invoices). "
+                "Excluye automáticamente: cancelled, voided, converted, draft, nota_pedido/np y facturas consolidadas."
             ),
             "parameters": {
                 "type": "object",
@@ -1777,13 +1791,22 @@ def _list_customer_invoices_from_supabase(
     select_cols = _invoices_select_expr()
     lim = max(1, min(limit, 200))
     desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+    # Statuses/types excluidos cuando no hay filtro explícito de estado (igual que el front)
+    excluded_statuses = ["cancelled", "voided", "converted", "draft"]
+    excluded_types = {"nota_pedido", "np"}
+    # Asegurar que los campos de filtro de validInvoices estén en el select
+    extra_cols = "invoice_type,warehouse_id,sales_order_id,payment_condition"
+    full_select = select_cols if all(c in select_cols for c in ["warehouse_id", "sales_order_id"]) \
+        else f"{select_cols},{extra_cols}"
     # Base query (reutilizada para count y para datos)
     def _base_q():
-        bq = client.table(table).select(select_cols).gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
+        bq = client.table(table).select(full_select).gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
         if filter_customer_id:
             bq = bq.eq(customer_id_c, filter_customer_id)
         if filter_status:
             bq = bq.eq("status", filter_status)
+        else:
+            bq = bq.not_.in_("status", excluded_statuses)
         return bq
     # COUNT exacto para saber el total real en la base de datos
     total_en_bd: int | None = None
@@ -1793,12 +1816,22 @@ def _list_customer_invoices_from_supabase(
             count_r = count_r.eq(customer_id_c, filter_customer_id)
         if filter_status:
             count_r = count_r.eq("status", filter_status)
+        else:
+            count_r = count_r.not_.in_("status", excluded_statuses)
         count_r = count_r.execute()
         total_en_bd = count_r.count
     except Exception:
         pass
     r = _base_q().order(date_c, desc=True).limit(lim).execute()
     rows: list[dict[str, Any]] = r.data or []
+    # Filtros cliente (igual que validInvoices del front) cuando no hay filtro explícito de estado
+    if not filter_status:
+        rows = [
+            x for x in rows
+            if (x.get("invoice_type") or "").lower() not in excluded_types
+            # Al menos uno de estos campos debe estar presente
+            and (x.get("warehouse_id") or x.get("sales_order_id") or x.get("payment_condition"))
+        ]
     rows = _attach_customers_to_orders(rows, customer_id_c)
     hay_mas = (total_en_bd is not None and total_en_bd > len(rows)) or (total_en_bd is None and len(rows) >= lim)
     result: dict[str, Any] = {
@@ -1825,13 +1858,68 @@ def _get_invoice_summary_from_supabase(
     date_c = _invoices_date_column()
     customer_id_c = _invoices_customer_id_column()
     desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
-    q = client.table(table).select(
-        "total_amount,paid_amount,remaining_amount,status"
-    ).gte(date_c, desde_filtro).lte(date_c, hasta_filtro)
-    if filter_customer_id:
-        q = q.eq(customer_id_c, filter_customer_id)
-    r = q.limit(5000).execute()
-    rows: list[dict[str, Any]] = r.data or []
+
+    # Paso 1: IDs que son destino de conversión (evitar doble conteo remito→factura)
+    excluded_ids: set[str] = set()
+    try:
+        excl_start = 0
+        pg = 1000
+        while True:
+            excl_r = (
+                client.table(table)
+                .select("converted_to_invoice_id")
+                .not_.is_("converted_to_invoice_id", "null")
+                .order("id")
+                .range(excl_start, excl_start + pg - 1)
+                .execute()
+            )
+            excl_rows = excl_r.data or []
+            for row in excl_rows:
+                if row.get("converted_to_invoice_id"):
+                    excluded_ids.add(row["converted_to_invoice_id"])
+            if len(excl_rows) < pg:
+                break
+            excl_start += pg
+            if excl_start > 500_000:
+                break
+    except Exception:
+        pass
+
+    # Paso 2: paginar facturas con filtros de fecha y estado (igual que el front: validInvoices)
+    excluded_statuses = ["cancelled", "voided", "converted", "draft"]
+    excluded_types = {"nota_pedido", "np"}
+    pg = 1000
+    start = 0
+    rows: list[dict[str, Any]] = []
+    while True:
+        q = (
+            client.table(table)
+            .select("id,total_amount,paid_amount,remaining_amount,status,invoice_type,warehouse_id,sales_order_id,payment_condition")
+            .gte(date_c, desde_filtro)
+            .lte(date_c, hasta_filtro)
+            .not_.in_("status", excluded_statuses)
+            .order("id")
+            .range(start, start + pg - 1)
+        )
+        if filter_customer_id:
+            q = q.eq(customer_id_c, filter_customer_id)
+        r = q.execute()
+        batch: list[dict[str, Any]] = r.data or []
+        for x in batch:
+            if x.get("id") in excluded_ids:
+                continue
+            if (x.get("invoice_type") or "").lower() in excluded_types:
+                continue
+            # Al menos uno de estos campos debe estar presente (igual que validInvoices del front)
+            if not (x.get("warehouse_id") or x.get("sales_order_id") or x.get("payment_condition")):
+                continue
+            rows.append(x)
+        if len(batch) < pg:
+            break
+        start += pg
+        if start > 500_000:
+            break
+
     total_facturado = sum(float(x.get("total_amount") or 0) for x in rows)
     total_cobrado = sum(float(x.get("paid_amount") or 0) for x in rows)
     saldo_pendiente = sum(float(x.get("remaining_amount") or 0) for x in rows)
@@ -1957,6 +2045,16 @@ def _list_sales_orders_from_supabase(
         select_parts.append(customer_id_col)
     select_cols = ",".join(select_parts)
     lim = max(1, min(limit, 200))
+    # COUNT exacto para saber el total real en la base de datos
+    total_en_bd: int | None = None
+    try:
+        count_q = client.table(table).select("id", count="exact").gte(date_c, desde).lte(date_c, hasta)
+        if filter_customer_id:
+            count_q = count_q.eq(customer_id_col, filter_customer_id)
+        count_r = count_q.execute()
+        total_en_bd = count_r.count
+    except Exception:
+        pass
     q = (
         client.table(table)
         .select(select_cols)
@@ -1969,14 +2067,33 @@ def _list_sales_orders_from_supabase(
     rows: list[dict[str, Any]] = r.data or []
     if _orders_include_customer_data():
         rows = _attach_customers_to_orders(rows, customer_id_col)
-    return {
+    amount_col = (os.environ.get("ERP_SUPABASE_ORDERS_LIST_SELECT") or "total_amount")
+    # Determinar columna de importe del listado
+    amount_cols = [p.strip() for p in (os.environ.get("ERP_SUPABASE_ORDERS_LIST_SELECT") or "total_amount").split(",") if p.strip()]
+    _amount_c = next((c for c in amount_cols if "amount" in c.lower() or "total" in c.lower()), None)
+    total_monto_devuelto = None
+    if _amount_c:
+        try:
+            total_monto_devuelto = round(sum(float(row.get(_amount_c) or 0) for row in rows), 2)
+        except Exception:
+            pass
+    hay_mas = (total_en_bd is not None and total_en_bd > len(rows)) or (total_en_bd is None and len(rows) >= lim)
+    result: dict[str, Any] = {
         "periodo": {"desde": desde, "hasta": hasta},
         "ordenes": rows,
         "cantidad_devuelta": len(rows),
         "limite": lim,
+        "hay_mas": hay_mas,
         "fuente": "supabase",
         "tabla": table,
     }
+    if total_en_bd is not None:
+        result["total_en_bd"] = total_en_bd
+    if total_monto_devuelto is not None:
+        result["total_monto_devuelto"] = total_monto_devuelto
+        if hay_mas:
+            result["advertencia_total"] = "El total_monto_devuelto incluye solo las órdenes mostradas, no todas las del período."
+    return result
 
 
 def _stub_count_sales_orders_by_status(desde: str, hasta: str) -> dict[str, Any]:
@@ -3283,7 +3400,7 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     except Exception:
         pass
 
-    # Paso 2: paginar facturas con filtros de fecha y estado
+    # Paso 2: paginar facturas con filtros de fecha y estado (igual que validInvoices del front)
     excluded_statuses = ["cancelled", "voided", "converted", "draft"]
     excluded_types = {"nota_pedido", "np"}
     page = 1000
@@ -3308,6 +3425,9 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
                 continue
             inv_type = (row.get("invoice_type") or "").lower()
             if inv_type in excluded_types:
+                continue
+            # Al menos uno de estos campos debe estar presente (igual que validInvoices del front)
+            if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
                 continue
             inv_rows.append(row)
         if len(rows) < page:
@@ -3671,7 +3791,7 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
             else:
                 result = _stub_list_sales_order_items(oid, lim)
         elif name == "list_customer_invoices":
-            lim = _coerce_limit(args.get("limit"), default=30, cap=200)
+            lim = _coerce_limit(args.get("limit"), default=10, cap=200)
             try:
                 desde, hasta = _resolve_orders_list_dates(args.get("desde"), args.get("hasta"))
             except ValueError as e:
