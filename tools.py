@@ -757,12 +757,13 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_top_sellers_by_invoicing",
             "description": (
-                "Ranking de vendedores basado en FACTURACIÓN REAL (customer_invoices: FA, FB, remito). "
+                "Ranking de VENDEDORES (no clientes) basado en FACTURACIÓN REAL (customer_invoices: FA, FB, remito). "
                 "Solo incluye comprobantes ya emitidos (productos facturados, en camino o entregados). "
                 "Usar cuando pregunten: 'quién más facturó', 'vendedor con mayor facturación', "
                 "'ranking por facturas emitidas', 'facturación real por vendedor', 'facturación de un vendedor'. "
                 "Si el usuario nombra un vendedor específico, usar limit alto (hasta 50) para poder ubicarlo en el ranking. "
-                "NO usar para órdenes de venta pendientes: para eso usar get_top_sellers."
+                "NO usar para órdenes de venta pendientes: para eso usar get_top_sellers. "
+                "NO usar si el usuario pregunta por CLIENTES: para eso usar get_top_customers_by_invoicing."
             ),
             "parameters": {
                 "type": "object",
@@ -782,6 +783,41 @@ TOOLS: list[dict[str, Any]] = [
                     "limit": {
                         "anyOf": [{"type": "integer"}, {"type": "string"}],
                         "description": "Máximo de vendedores a devolver (default 10, máx 50)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_top_customers_by_invoicing",
+            "description": (
+                "Ranking de CLIENTES por facturación acumulada real (customer_invoices). "
+                "Suma el total facturado por cliente en el período, excluyendo canceladas, anuladas, borradores y facturas consolidadas. "
+                "Usar cuando pregunten: 'cliente con mayor facturación', 'qué cliente compró más', "
+                "'ranking de clientes', 'mejor cliente', 'clientes con más compras', 'top clientes'. "
+                "NO confundir con vendedores: si el usuario dice 'vendedor' usar get_top_sellers_by_invoicing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio inclusive YYYY-MM-DD (opcional; se infiere si falta)",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin inclusive YYYY-MM-DD (opcional; default hoy)",
+                    },
+                    "metric": {
+                        "type": "string",
+                        "description": "Métrica: 'monto' (suma total_amount, default) o 'cantidad' (conteo de facturas)",
+                    },
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Máximo de clientes a devolver (default 10, máx 50)",
                     },
                 },
                 "required": [],
@@ -3493,6 +3529,135 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     }
 
 
+def _stub_top_customers_by_invoicing(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
+    demo = [
+        {"customer_id": "demo-cust-1", "nombre": "Cliente Demo A", "total_facturado": 900000.0, "cantidad_facturas": 15},
+        {"customer_id": "demo-cust-2", "nombre": "Cliente Demo B", "total_facturado": 650000.0, "cantidad_facturas": 10},
+        {"customer_id": "demo-cust-3", "nombre": "Cliente Demo C", "total_facturado": 420000.0, "cantidad_facturas": 7},
+    ]
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "metrica": metric,
+        "top_clientes": demo[:limit],
+        "cantidad_devuelta": min(len(demo), limit),
+        "limite": limit,
+        "fuente": "stub",
+        "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para leer Postgres",
+    }
+
+
+def _top_customers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _invoices_table()
+    date_c = _invoices_date_column()
+    amount_c = _invoices_amount_col()
+    customer_id_c = _invoices_customer_id_column()
+
+    # Paso 1: IDs que son destino de conversión (evitar doble conteo remito→factura)
+    page = 1000
+    excluded_ids: set[str] = set()
+    try:
+        excl_start = 0
+        while True:
+            excl_r = (
+                client.table(table)
+                .select("converted_to_invoice_id")
+                .not_.is_("converted_to_invoice_id", "null")
+                .order("id")
+                .range(excl_start, excl_start + page - 1)
+                .execute()
+            )
+            excl_rows = excl_r.data or []
+            for row in excl_rows:
+                if row.get("converted_to_invoice_id"):
+                    excluded_ids.add(row["converted_to_invoice_id"])
+            if len(excl_rows) < page:
+                break
+            excl_start += page
+            if excl_start > 500_000:
+                break
+    except Exception:
+        pass
+
+    # Paso 2: paginar facturas con filtros (igual que validInvoices del front)
+    excluded_statuses = ["cancelled", "voided", "converted", "draft"]
+    excluded_types = {"nota_pedido", "np"}
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+    start = 0
+    inv_rows: list[dict[str, Any]] = []
+    while True:
+        r = (
+            client.table(table)
+            .select(f"id,{amount_c},{customer_id_c},warehouse_id,sales_order_id,payment_condition,invoice_type")
+            .gte(date_c, desde_filtro)
+            .lte(date_c, hasta_filtro)
+            .not_.in_("status", excluded_statuses)
+            .order("id")
+            .range(start, start + page - 1)
+            .execute()
+        )
+        rows: list[dict[str, Any]] = r.data or []
+        for row in rows:
+            if row.get("id") in excluded_ids:
+                continue
+            if (row.get("invoice_type") or "").lower() in excluded_types:
+                continue
+            if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
+                continue
+            inv_rows.append(row)
+        if len(rows) < page:
+            break
+        start += page
+        if start > 500_000:
+            break
+
+    # Paso 3: agregar por cliente
+    agg: dict[Any, dict[str, float]] = {}
+    for row in inv_rows:
+        cid = row.get(customer_id_c)
+        if cid is None:
+            continue
+        cur = agg.setdefault(cid, {"total_facturado": 0.0, "cantidad_facturas": 0})
+        cur["total_facturado"] += _to_float(row.get(amount_c))
+        cur["cantidad_facturas"] += 1
+
+    # Paso 4: resolver nombres de clientes
+    cust_table, id_c, name_c, *_ = _customer_column_config()
+    customer_ids = list(agg.keys())
+    names: dict[Any, str] = {}
+    chunk_sz = 200
+    for i in range(0, len(customer_ids), chunk_sz):
+        chunk = customer_ids[i : i + chunk_sz]
+        try:
+            cr = client.table(cust_table).select(f"{id_c},{name_c}").in_(id_c, chunk).execute()
+            for crow in cr.data or []:
+                names[crow.get(id_c)] = str(crow.get(name_c) or "")
+        except Exception:
+            pass
+
+    sort_key = "total_facturado" if metric != "cantidad" else "cantidad_facturas"
+    ranked = sorted(agg.items(), key=lambda kv: -kv[1][sort_key])
+    out: list[dict[str, Any]] = []
+    for cid, vals in ranked[:limit]:
+        out.append({
+            "customer_id": cid,
+            "nombre": names.get(cid) or str(cid),
+            "total_facturado": round(vals["total_facturado"], 2),
+            "cantidad_facturas": vals["cantidad_facturas"],
+        })
+
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "metrica": metric,
+        "top_clientes": out,
+        "cantidad_devuelta": len(out),
+        "limite": limit,
+        "fuente": "supabase",
+        "tabla": table,
+    }
+
+
 def _stub_top_sellers(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
     demo = [
         {"user_id": "demo-user-1", "nombre": "Ana Gómez", "total_monto": 850000.0, "cantidad_ordenes": 12},
@@ -3912,6 +4077,19 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _top_sellers_by_invoicing_from_supabase(desde, hasta, metric, lim)
             else:
                 result = _stub_top_sellers_by_invoicing(desde, hasta, metric, lim)
+        elif name == "get_top_customers_by_invoicing":
+            lim = _coerce_limit(args.get("limit"), default=10, cap=50)
+            metric = str(args.get("metric") or "monto").strip().lower()
+            if metric not in ("monto", "cantidad"):
+                metric = "monto"
+            try:
+                desde, hasta = _resolve_orders_list_dates(args.get("desde"), args.get("hasta"))
+            except ValueError as e:
+                return json.dumps({"error": str(e)}, ensure_ascii=False)
+            if use_sb:
+                result = _top_customers_by_invoicing_from_supabase(desde, hasta, metric, lim)
+            else:
+                result = _stub_top_customers_by_invoicing(desde, hasta, metric, lim)
         else:
             return json.dumps({"error": f"tool desconocida: {name}"})
         return json.dumps(result, ensure_ascii=False)
