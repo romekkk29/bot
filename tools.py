@@ -499,6 +499,30 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_customer_balance",
+            "description": (
+                "Devuelve el saldo de cuenta corriente de un cliente: cuánto debe (total_debt > 0) "
+                "o si tiene saldo a favor (total_debt < 0). "
+                "Usa la vista 'customer_balances_view' de Supabase, igual que el ERP. "
+                "Usar cuando pregunten: 'saldo de cuenta corriente', 'cuánto debe', 'saldo del cliente', "
+                "'deuda del cliente', 'tiene saldo a favor', 'estado de cuenta', 'cuánto le debemos'. "
+                "El campo total_debt positivo indica deuda; negativo indica crédito a favor del cliente."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "customer": {
+                        "type": "string",
+                        "description": "Nombre, CUIT o UUID del cliente a consultar.",
+                    },
+                },
+                "required": ["customer"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_sales_order_items",
             "description": (
                 "Lista los ítems/líneas de una orden de venta específica. "
@@ -792,13 +816,38 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_top_customers_by_debt",
+            "description": (
+                "Ranking de clientes ordenados por SALDO DE DEUDA (cuenta corriente), de mayor a menor. "
+                "Usa la vista customer_balances_view, igual que el ERP. "
+                "Usar cuando pregunten: 'qué cliente debe más', 'cliente con mayor deuda', "
+                "'ranking de deudores', 'quién tiene mayor saldo pendiente', 'top deudores', "
+                "'cuáles son los clientes más endeudados', 'quién me debe más'. "
+                "NO usar para ranking de facturación: para eso usar get_top_customers_by_invoicing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Máximo de clientes a devolver (default 10, máx 50)",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_top_customers_by_invoicing",
             "description": (
                 "Ranking de CLIENTES por facturación acumulada real (customer_invoices). "
                 "Suma el total facturado por cliente en el período, excluyendo canceladas, anuladas, borradores y facturas consolidadas. "
                 "Usar cuando pregunten: 'cliente con mayor facturación', 'qué cliente compró más', "
                 "'ranking de clientes', 'mejor cliente', 'clientes con más compras', 'top clientes'. "
-                "NO confundir con vendedores: si el usuario dice 'vendedor' usar get_top_sellers_by_invoicing."
+                "NO confundir con vendedores: si el usuario dice 'vendedor' usar get_top_sellers_by_invoicing. "
+                "NO usar para ranking de deuda: para eso usar get_top_customers_by_debt."
             ),
             "parameters": {
                 "type": "object",
@@ -2065,6 +2114,70 @@ def _resolve_customer_id_by_name(name: str) -> str | None:
     r = client.table(table).select(id_c).filter(name_c, "ilike", f"%{tok}%").limit(1).execute()
     rows = r.data or []
     return str(rows[0][id_c]) if rows and rows[0].get(id_c) else None
+
+
+def _customer_balance_from_supabase(customer: str) -> dict[str, Any]:
+    """Consulta customer_balances_view para un cliente dado (nombre, CUIT o UUID)."""
+    client = _get_supabase()
+    assert client is not None
+
+    import re as _re
+    _UUID_RE = _re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", _re.IGNORECASE)
+
+    # Resolver customer_id
+    if _UUID_RE.match(customer.strip()):
+        customer_id = customer.strip()
+        customer_name: str | None = None
+    else:
+        table, id_c, name_c, tax_c, *_ = _customer_column_config()
+        tok = _like_token(customer)
+        pat = f"%{tok}%"
+        r = (
+            client.table(table)
+            .select(f"{id_c},{name_c},{tax_c}")
+            .or_(f"{name_c}.ilike.{pat},{tax_c}.ilike.{pat}")
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        if not rows:
+            return {"error": f"No se encontró ningún cliente que coincida con '{customer}'"}
+        customer_id = str(rows[0][id_c])
+        customer_name = str(rows[0].get(name_c) or "")
+
+    # Consultar vista de saldos
+    r2 = (
+        client.from_("customer_balances_view")  # type: ignore[arg-type]
+        .select("customer_id,total_debt,total_debt_bn1,total_debt_bn2,overdue_debt,current_debt,pending_invoices_count")
+        .eq("customer_id", customer_id)
+        .limit(1)
+        .execute()
+    )
+    rows2 = r2.data or []
+    if not rows2:
+        return {
+            "customer_id": customer_id,
+            "nombre": customer_name,
+            "total_debt": 0.0,
+            "situacion": "sin_movimientos",
+            "mensaje": "El cliente no tiene movimientos registrados en cuenta corriente.",
+        }
+
+    row = rows2[0]
+    total_debt = float(row.get("total_debt") or 0)
+    situacion = "deuda" if total_debt > 0 else ("saldo_a_favor" if total_debt < 0 else "saldado")
+    return {
+        "customer_id": customer_id,
+        "nombre": customer_name,
+        "total_debt": round(total_debt, 2),
+        "total_debt_bn1": round(float(row.get("total_debt_bn1") or 0), 2),
+        "total_debt_bn2": round(float(row.get("total_debt_bn2") or 0), 2),
+        "overdue_debt": round(float(row.get("overdue_debt") or 0), 2),
+        "current_debt": round(float(row.get("current_debt") or 0), 2),
+        "pending_invoices_count": int(row.get("pending_invoices_count") or 0),
+        "situacion": situacion,
+        "fuente": "customer_balances_view",
+    }
 
 
 def _list_sales_orders_from_supabase(
@@ -3546,6 +3659,79 @@ def _stub_top_customers_by_invoicing(desde: str, hasta: str, metric: str, limit:
     }
 
 
+def _top_customers_by_debt_from_supabase(limit: int) -> dict[str, Any]:
+    """Devuelve los clientes con mayor saldo de deuda usando customer_balances_view."""
+    client = _get_supabase()
+    assert client is not None
+    lim = max(1, min(limit, 50))
+
+    # Paso 1: traer todos los saldos positivos ordenados por deuda DESC
+    PAGE_SIZE = 1000
+    all_balances: list[dict[str, Any]] = []
+    start = 0
+    while True:
+        r = (
+            client.from_("customer_balances_view")  # type: ignore[arg-type]
+            .select("customer_id,total_debt,overdue_debt,current_debt,pending_invoices_count")
+            .gt("total_debt", 0)
+            .order("total_debt", desc=True)
+            .range(start, start + PAGE_SIZE - 1)
+            .execute()
+        )
+        rows = r.data or []
+        all_balances.extend(rows)
+        if len(rows) < PAGE_SIZE:
+            break
+        start += PAGE_SIZE
+        if start > 100_000:
+            break
+
+    top_balances = all_balances[:lim]
+    if not top_balances:
+        return {"top_clientes": [], "cantidad_devuelta": 0, "fuente": "customer_balances_view"}
+
+    # Paso 2: enriquecer con nombre y CUIT
+    customer_ids = [row["customer_id"] for row in top_balances]
+    table, id_c, name_c, tax_c, *_ = _customer_column_config()
+    customer_map: dict[str, dict[str, str]] = {}
+    CHUNK = 50
+    for i in range(0, len(customer_ids), CHUNK):
+        chunk = customer_ids[i: i + CHUNK]
+        cr = (
+            client.table(table)
+            .select(f"{id_c},{name_c},{tax_c}")
+            .in_(id_c, chunk)
+            .execute()
+        )
+        for cust in (cr.data or []):
+            customer_map[str(cust[id_c])] = {
+                "nombre": str(cust.get(name_c) or ""),
+                "tax_id": str(cust.get(tax_c) or ""),
+            }
+
+    result_rows = []
+    for i, row in enumerate(top_balances, start=1):
+        cid = row["customer_id"]
+        info = customer_map.get(cid, {"nombre": "", "tax_id": ""})
+        result_rows.append({
+            "posicion": i,
+            "customer_id": cid,
+            "nombre": info["nombre"],
+            "tax_id": info["tax_id"],
+            "total_debt": round(float(row.get("total_debt") or 0), 2),
+            "overdue_debt": round(float(row.get("overdue_debt") or 0), 2),
+            "current_debt": round(float(row.get("current_debt") or 0), 2),
+            "pending_invoices_count": int(row.get("pending_invoices_count") or 0),
+        })
+
+    return {
+        "top_clientes": result_rows,
+        "cantidad_devuelta": len(result_rows),
+        "limite": lim,
+        "fuente": "customer_balances_view",
+    }
+
+
 def _top_customers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
     client = _get_supabase()
     assert client is not None
@@ -3795,6 +3981,24 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 if use_sb
                 else _stub_customers(str(args["query"]), lim)
             )
+        elif name == "get_customer_balance":
+            customer_arg = str(args["customer"]).strip()
+            if use_sb:
+                result = _customer_balance_from_supabase(customer_arg)
+            else:
+                # stub: devuelve datos de ejemplo
+                result = {
+                    "customer_id": "demo-id",
+                    "nombre": customer_arg,
+                    "total_debt": 150000.0,
+                    "total_debt_bn1": 90000.0,
+                    "total_debt_bn2": 60000.0,
+                    "overdue_debt": 50000.0,
+                    "current_debt": 100000.0,
+                    "pending_invoices_count": 3,
+                    "situacion": "deuda",
+                    "fuente": "stub",
+                }
         elif name == "list_sales_orders":
             lim = _coerce_limit(args.get("limit"), default=30, cap=200)
             try:
@@ -4090,6 +4294,19 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _top_customers_by_invoicing_from_supabase(desde, hasta, metric, lim)
             else:
                 result = _stub_top_customers_by_invoicing(desde, hasta, metric, lim)
+        elif name == "get_top_customers_by_debt":
+            lim = _coerce_limit(args.get("limit"), default=10, cap=50)
+            if use_sb:
+                result = _top_customers_by_debt_from_supabase(lim)
+            else:
+                result = {
+                    "top_clientes": [
+                        {"posicion": 1, "nombre": "Cliente Demo A", "tax_id": "20-00000001-0", "total_debt": 500000.0, "overdue_debt": 300000.0, "current_debt": 200000.0, "pending_invoices_count": 5},
+                        {"posicion": 2, "nombre": "Cliente Demo B", "tax_id": "20-00000002-0", "total_debt": 320000.0, "overdue_debt": 120000.0, "current_debt": 200000.0, "pending_invoices_count": 3},
+                    ],
+                    "cantidad_devuelta": 2,
+                    "fuente": "stub",
+                }
         else:
             return json.dumps({"error": f"tool desconocida: {name}"})
         return json.dumps(result, ensure_ascii=False)
