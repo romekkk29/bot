@@ -873,6 +873,43 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_product_sales_units",
+            "description": (
+                "Consulta cuántas unidades/kg se vendieron (facturaron) de un producto específico en un rango de fechas. "
+                "Acepta nombre parcial, SKU, código o cualquier texto que identifique el producto (búsqueda no exacta). "
+                "Devuelve por producto: nombre, SKU/código, sale_unit (unidad de venta), "
+                "cantidad_vendida (unidades), kg_vendidos (kilos calculados según unit_weight o sale_unit), "
+                "monto_vendido ($ total facturado) y cantidad_ventas (número de facturas distintas). "
+                "Usar cuando el usuario pregunte: '¿cuánto se vendió de X?', '¿cuántas unidades de X?', "
+                "'¿cuántos kilos de X?', '¿cuántos kg de X?', 'unidades vendidas de X', "
+                "'ventas del producto X', 'cuánto facturamos de X', '¿en cuántas ventas aparece X?', "
+                "'qué cantidad se vendió de X', 'total de X vendido'. "
+                "Si el usuario no especifica fechas, usar los últimos 30 días. "
+                "Si la búsqueda devuelve varios productos similares, se muestran todos con sus cantidades."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Nombre, SKU, código o texto que identifique el producto (búsqueda parcial/no exacta)",
+                    },
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio inclusive YYYY-MM-DD (opcional; si no se provee, se usan los últimos 30 días)",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin inclusive YYYY-MM-DD (opcional; default hoy)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 # ContextVar para override por request (multi-tenant, async-safe)
@@ -1180,6 +1217,20 @@ def _product_table_columns() -> tuple[str, str, str, str | None]:
     if uuid_col is not None and not _safe_sql_identifier(uuid_col):
         raise ValueError(f"nombre de columna inválido (uuid): {uuid_col!r}")
     return code, name, price, uuid_col
+
+
+def _product_col_sale_unit() -> str:
+    c = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_SALE_UNIT", "sale_unit") or "sale_unit").strip()
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_PRODUCT_COL_SALE_UNIT inválida: {c!r}")
+    return c
+
+
+def _product_col_unit_weight() -> str:
+    c = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_UNIT_WEIGHT", "unit_weight") or "unit_weight").strip()
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_PRODUCT_COL_UNIT_WEIGHT inválida: {c!r}")
+    return c
 
 
 def _product_select_list(code: str, name: str, price: str, uuid_col: str | None) -> str:
@@ -1756,6 +1807,34 @@ def _invoice_items_select_expr() -> str:
     return ",".join(parts)
 
 
+def _invoice_items_product_id_col() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PRODUCT_ID_COL", "product_id") or "product_id").strip()
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICE_ITEMS_PRODUCT_ID_COL inválida: {c!r}")
+    return c
+
+
+def _invoice_items_qty_col() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_QTY_COL", "quantity") or "quantity").strip()
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICE_ITEMS_QTY_COL inválida: {c!r}")
+    return c
+
+
+def _invoice_items_fk_col() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_FK_COL", "customer_invoice_id") or "customer_invoice_id").strip()
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICE_ITEMS_FK_COL inválida: {c!r}")
+    return c
+
+
+def _invoice_items_amount_col() -> str:
+    c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_AMOUNT_COL", "line_total") or "line_total").strip()
+    if not _safe_sql_identifier(c):
+        raise ValueError(f"ERP_SUPABASE_INVOICE_ITEMS_AMOUNT_COL inválida: {c!r}")
+    return c
+
+
 def _payments_table() -> str:
     t = (os.environ.get("ERP_SUPABASE_PAYMENTS_TABLE") or "customer_payments").strip() or "customer_payments"
     if not _safe_sql_identifier(t):
@@ -2039,6 +2118,223 @@ def _list_customer_invoice_items_from_supabase(invoice_id: str, limit: int) -> d
         "limite": lim,
         "fuente": "supabase",
         "tabla": table,
+    }
+
+
+def _stub_get_product_sales_units(query: str, desde: str, hasta: str) -> dict[str, Any]:
+    return {
+        "query": query,
+        "periodo": {"desde": desde, "hasta": hasta},
+        "productos": [
+            {
+                "nombre": f"Producto demo ({query})",
+                "sku_o_codigo": "DEMO-001",
+                "sale_unit": "KG",
+                "cantidad_vendida": 42.0,
+                "kg_vendidos": 42.0,
+                "monto_vendido": 21000.0,
+                "cantidad_ventas": 7,
+            }
+        ],
+        "cantidad_productos_encontrados": 1,
+        "fuente": "stub",
+    }
+
+
+def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+
+    # 1. Resolver producto(s) por nombre/SKU (búsqueda parcial ilike)
+    products = _resolve_products_by_query(query, limit=10)
+    if not products:
+        return {
+            "query": query,
+            "periodo": {"desde": desde, "hasta": hasta},
+            "productos": [],
+            "cantidad_productos_encontrados": 0,
+            "mensaje": f"No se encontraron productos con '{query}'",
+            "fuente": "supabase",
+        }
+
+    code_c, name_c, _, uuid_c = _product_table_columns()
+    if not uuid_c:
+        raise ValueError("ERP_SUPABASE_PRODUCT_COL_UUID es obligatorio para consultar ventas por producto")
+
+    # Construir mapa product_uuid → info del producto
+    product_map: dict[Any, dict[str, Any]] = {}
+    for p in products:
+        pid = p.get("id") or p.get(uuid_c)
+        if pid:
+            product_map[pid] = {
+                "nombre": p.get("nombre") or p.get(name_c),
+                "sku_o_codigo": p.get("sku_o_codigo") or p.get(code_c),
+                "sale_unit": "",
+                "unit_weight": 0.0,
+            }
+
+    if not product_map:
+        return {
+            "query": query,
+            "periodo": {"desde": desde, "hasta": hasta},
+            "productos": [],
+            "cantidad_productos_encontrados": len(products),
+            "mensaje": "Productos encontrados pero sin UUID (revisar ERP_SUPABASE_PRODUCT_COL_UUID)",
+            "fuente": "supabase",
+        }
+
+    product_ids = list(product_map.keys())
+
+    # 2. Obtener sale_unit y unit_weight para calcular kg
+    sale_unit_c = _product_col_sale_unit()
+    unit_weight_c = _product_col_unit_weight()
+    try:
+        wp_r = (
+            client.table(_products_table())
+            .select(f"{uuid_c},{sale_unit_c},{unit_weight_c}")
+            .in_(uuid_c, product_ids)
+            .execute()
+        )
+        for wp in (wp_r.data or []):
+            pid = wp.get(uuid_c)
+            if pid in product_map:
+                product_map[pid]["sale_unit"] = (wp.get(sale_unit_c) or "").upper()
+                product_map[pid]["unit_weight"] = _to_float(wp.get(unit_weight_c))
+    except Exception:
+        # Si las columnas no existen en este deploy, continuar sin info de peso
+        pass
+
+    # 3. Obtener IDs de facturas válidas en el rango de fechas
+    invoices_table = _invoices_table()
+    date_c = _invoices_date_column()
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+    excluded_statuses = ["cancelled", "voided", "converted", "draft"]
+    excluded_types = {"nota_pedido", "np"}
+
+    page = 1000
+    invoice_ids: list[Any] = []
+    start = 0
+    while True:
+        r = (
+            client.table(invoices_table)
+            .select("id,invoice_type,warehouse_id,sales_order_id,payment_condition")
+            .gte(date_c, desde_filtro)
+            .lte(date_c, hasta_filtro)
+            .not_.in_("status", excluded_statuses)
+            .range(start, start + page - 1)
+            .execute()
+        )
+        rows = r.data or []
+        for row in rows:
+            if (row.get("invoice_type") or "").lower() not in excluded_types:
+                if row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition"):
+                    if row.get("id"):
+                        invoice_ids.append(row["id"])
+        if len(rows) < page:
+            break
+        start += page
+        if start > 500_000:
+            break
+
+    invoice_ids = list(dict.fromkeys(invoice_ids))
+    if not invoice_ids:
+        return {
+            "query": query,
+            "periodo": {"desde": desde, "hasta": hasta},
+            "productos": [
+                {
+                    "nombre": info["nombre"],
+                    "sku_o_codigo": info["sku_o_codigo"],
+                    "sale_unit": info["sale_unit"],
+                    "cantidad_vendida": 0.0,
+                    "kg_vendidos": 0.0,
+                    "monto_vendido": 0.0,
+                    "cantidad_ventas": 0,
+                }
+                for info in product_map.values()
+            ],
+            "cantidad_productos_encontrados": len(product_map),
+            "fuente": "supabase",
+        }
+
+    # 4. Agregar unidades, kg y conteo de ventas desde customer_invoice_items
+    items_table = _invoice_items_table()
+    fk_c = _invoice_items_fk_col()
+    product_id_c = _invoice_items_product_id_col()
+    qty_c = _invoice_items_qty_col()
+    amount_c = _invoice_items_amount_col()
+
+    try:
+        chunk_sz = int(os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_INVOICE_ID_CHUNK", "80") or "80")
+    except ValueError:
+        chunk_sz = 80
+    chunk_sz = max(1, min(chunk_sz, 200))
+
+    agg: dict[Any, dict[str, Any]] = {
+        pid: {"cantidad_vendida": 0.0, "kg_vendidos": 0.0, "monto_vendido": 0.0, "_invoice_ids": set()}
+        for pid in product_ids
+    }
+
+    for i in range(0, len(invoice_ids), chunk_sz):
+        chunk = invoice_ids[i : i + chunk_sz]
+        start_inner = 0
+        while True:
+            r = (
+                client.table(items_table)
+                .select(f"{fk_c},{product_id_c},{qty_c},{amount_c}")
+                .in_(fk_c, chunk)
+                .in_(product_id_c, product_ids)
+                .range(start_inner, start_inner + page - 1)
+                .execute()
+            )
+            rows = r.data or []
+            for row in rows:
+                pid = row.get(product_id_c)
+                if pid not in agg:
+                    continue
+                raw_qty = _to_float(row.get(qty_c))
+                agg[pid]["cantidad_vendida"] += raw_qty
+                agg[pid]["monto_vendido"] += _to_float(row.get(amount_c))
+                # Calcular kg: misma lógica que BrandSalesReport.tsx
+                info = product_map[pid]
+                sale_unit = info.get("sale_unit", "")
+                unit_weight = info.get("unit_weight", 0.0)
+                if "KG" in sale_unit or "LBS" in sale_unit:
+                    agg[pid]["kg_vendidos"] += raw_qty
+                elif unit_weight:
+                    agg[pid]["kg_vendidos"] += raw_qty * unit_weight
+                # Trackear factura distinta
+                inv_id = row.get(fk_c)
+                if inv_id:
+                    agg[pid]["_invoice_ids"].add(inv_id)
+            if len(rows) < page:
+                break
+            start_inner += page
+            if start_inner > 500_000:
+                break
+
+    # Construir resultado final
+    result_list = [
+        {
+            "nombre": product_map[pid]["nombre"],
+            "sku_o_codigo": product_map[pid]["sku_o_codigo"],
+            "sale_unit": product_map[pid]["sale_unit"],
+            "cantidad_vendida": agg[pid]["cantidad_vendida"],
+            "kg_vendidos": round(agg[pid]["kg_vendidos"], 3),
+            "monto_vendido": agg[pid]["monto_vendido"],
+            "cantidad_ventas": len(agg[pid]["_invoice_ids"]),
+        }
+        for pid in product_ids
+    ]
+    result_list.sort(key=lambda x: x["cantidad_vendida"], reverse=True)
+
+    return {
+        "query": query,
+        "periodo": {"desde": desde, "hasta": hasta},
+        "productos": result_list,
+        "cantidad_productos_encontrados": len(result_list),
+        "fuente": "supabase",
+        "tabla_items": items_table,
     }
 
 
@@ -4307,6 +4603,16 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                     "cantidad_devuelta": 2,
                     "fuente": "stub",
                 }
+        elif name == "get_product_sales_units":
+            query = str(args["query"]).strip()
+            try:
+                desde, hasta = _resolve_orders_list_dates(args.get("desde"), args.get("hasta"))
+            except ValueError as e:
+                return json.dumps({"error": str(e)}, ensure_ascii=False)
+            if use_sb:
+                result = _get_product_sales_units_from_supabase(query, desde, hasta)
+            else:
+                result = _stub_get_product_sales_units(query, desde, hasta)
         else:
             return json.dumps({"error": f"tool desconocida: {name}"})
         return json.dumps(result, ensure_ascii=False)
