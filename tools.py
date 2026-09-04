@@ -124,8 +124,13 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_top_selling_products",
             "description": (
-                "Obtiene top productos vendidos en un rango de fechas a partir de líneas de venta. "
-                "Devuelve ranking por cantidad y monto vendido por producto."
+                "Obtiene el ranking de productos más vendidos en un rango de fechas (por cantidad y monto). "
+                "Incluye estimación de costo de mercadería (basado en cost_price del producto), utilidad estimada y markup por producto. "
+                "Usar cuando el usuario pregunte: 'productos más vendidos', 'top de ventas', 'qué se vendió más', "
+                "'qué producto me deja más ganancia' (mostrar ranking con margen estimado y aclarar que para ranking exacto por ganancia debe ir al Reporte de Rentabilidad del ERP), "
+                "'cuánto gano con X producto'. "
+                "IMPORTANTE: el margen es una ESTIMACIÓN basada en el cost_price actual del producto; "
+                "para margen exacto del período usar get_profit_margin_summary o el Reporte de Rentabilidad del ERP."
             ),
             "parameters": {
                 "type": "object",
@@ -645,6 +650,44 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_profit_margin_summary",
+            "description": (
+                "Calcula el margen de ganancia real del período: costo de mercadería (con IVA), "
+                "utilidad, markup (ganancia / costo × 100) y porcentaje de utilidad sobre ventas. "
+                "El costo se obtiene de los ítems de cada factura (purchase_cost por línea, "
+                "con fallback al cost_price del producto), igual que muestra el reporte del ERP. "
+                "Usar cuando el usuario pregunte: 'margen de ganancia', 'cuánto gané realmente', "
+                "'cuál es mi rentabilidad', 'ganancia real', 'utilidad del período', "
+                "'costo de mercadería del mes', 'markup del período', 'cuánto gané', "
+                "'cuánto es la ganancia', 'margen real', 'rentabilidad real'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio inclusive YYYY-MM-DD",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin inclusive YYYY-MM-DD",
+                    },
+                    "customer_name": {
+                        "type": "string",
+                        "description": "Nombre o razón social del cliente (opcional)",
+                    },
+                    "customer_id": {
+                        "type": "string",
+                        "description": "UUID del cliente (opcional)",
+                    },
+                },
+                "required": ["desde", "hasta"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_customer_invoice_items",
             "description": (
                 "Lista los ítems/líneas de una factura de cliente específica. "
@@ -880,15 +923,15 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Consulta cuántas unidades/kg se vendieron (facturaron) de un producto específico en un rango de fechas. "
                 "Acepta nombre parcial, SKU, código o cualquier texto que identifique el producto (búsqueda no exacta). "
-                "Devuelve por producto: nombre, SKU/código, sale_unit (unidad de venta), "
-                "cantidad_vendida (unidades), kg_vendidos (kilos calculados según unit_weight o sale_unit), "
-                "monto_vendido ($ total facturado) y cantidad_ventas (número de facturas distintas). "
+                "Devuelve por producto: nombre, SKU/código, sale_unit, cantidad_vendida, kg_vendidos, "
+                "monto_vendido, costo_mercaderia (c/ IVA, exacto desde purchase_cost del ítem o cost_price del producto), "
+                "utilidad, markup_pct y pct_utilidad_ventas, y cantidad_ventas. "
                 "Usar cuando el usuario pregunte: '¿cuánto se vendió de X?', '¿cuántas unidades de X?', "
-                "'¿cuántos kilos de X?', '¿cuántos kg de X?', 'unidades vendidas de X', "
-                "'ventas del producto X', 'cuánto facturamos de X', '¿en cuántas ventas aparece X?', "
+                "'¿cuántos kilos de X?', 'ventas del producto X', 'cuánto facturamos de X', "
+                "'cuánto gano con X', 'margen de X', 'ganancia de X', 'rentabilidad de X', "
                 "'qué cantidad se vendió de X', 'total de X vendido'. "
                 "Si el usuario no especifica fechas, usar los últimos 30 días. "
-                "Si la búsqueda devuelve varios productos similares, se muestran todos con sus cantidades."
+                "Si la búsqueda devuelve varios productos similares, se muestran todos con sus cantidades y márgenes."
             ),
             "parameters": {
                 "type": "object",
@@ -2103,6 +2146,253 @@ def _get_invoice_summary_from_supabase(
     }
 
 
+def _stub_get_profit_margin(desde: str, hasta: str) -> dict[str, Any]:
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "total_ventas": 500000.0,
+        "total_costo_mercaderia": 350000.0,
+        "utilidad": 150000.0,
+        "markup_pct": 42.9,
+        "pct_utilidad_sobre_ventas": 30.0,
+        "cantidad_facturas": 12,
+        "items_procesados": 48,
+        "items_con_costo_registrado": 48,
+        "items_sin_costo": 0,
+        "fuente": "stub",
+        "nota_metodologia": "Costo de mercadería c/ IVA. Markup = Utilidad / Costo × 100. % Utilidad = Utilidad / Venta × 100.",
+    }
+
+
+def _get_profit_margin_from_supabase(
+    desde: str, hasta: str,
+    filter_customer_id: str | None = None,
+) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _invoices_table()
+    date_c = _invoices_date_column()
+    customer_id_c = _invoices_customer_id_column()
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+
+    # Paso 1: IDs de facturas convertidas a excluir (evitar doble conteo)
+    excluded_ids: set[str] = set()
+    try:
+        excl_start = 0
+        pg = 1000
+        while True:
+            excl_r = (
+                client.table(table)
+                .select("converted_to_invoice_id")
+                .not_.is_("converted_to_invoice_id", "null")
+                .order("id")
+                .range(excl_start, excl_start + pg - 1)
+                .execute()
+            )
+            excl_rows = excl_r.data or []
+            for row in excl_rows:
+                if row.get("converted_to_invoice_id"):
+                    excluded_ids.add(row["converted_to_invoice_id"])
+            if len(excl_rows) < pg:
+                break
+            excl_start += pg
+            if excl_start > 500_000:
+                break
+    except Exception:
+        pass
+
+    # Paso 2: Obtener facturas válidas con total_amount (igual que get_invoice_summary)
+    excluded_statuses = ["cancelled", "voided", "converted", "draft"]
+    excluded_types = {"nota_pedido", "np"}
+    pg = 1000
+    start = 0
+    invoice_rows: list[dict[str, Any]] = []
+    while True:
+        q = (
+            client.table(table)
+            .select("id,total_amount,invoice_type,warehouse_id,sales_order_id,payment_condition")
+            .gte(date_c, desde_filtro)
+            .lte(date_c, hasta_filtro)
+            .not_.in_("status", excluded_statuses)
+            .order("id")
+            .range(start, start + pg - 1)
+        )
+        if filter_customer_id:
+            q = q.eq(customer_id_c, filter_customer_id)
+        r = q.execute()
+        batch: list[dict[str, Any]] = r.data or []
+        for x in batch:
+            if x.get("id") in excluded_ids:
+                continue
+            if (x.get("invoice_type") or "").lower() in excluded_types:
+                continue
+            if not (x.get("warehouse_id") or x.get("sales_order_id") or x.get("payment_condition")):
+                continue
+            invoice_rows.append(x)
+        if len(batch) < pg:
+            break
+        start += pg
+        if start > 500_000:
+            break
+
+    if not invoice_rows:
+        return {
+            "periodo": {"desde": desde, "hasta": hasta},
+            "total_ventas": 0.0,
+            "total_costo_mercaderia": 0.0,
+            "utilidad": 0.0,
+            "markup_pct": 0.0,
+            "pct_utilidad_sobre_ventas": 0.0,
+            "cantidad_facturas": 0,
+            "fuente": "supabase",
+        }
+
+    total_ventas = sum(_to_float(x.get("total_amount")) for x in invoice_rows)
+    invoice_ids = [x["id"] for x in invoice_rows if x.get("id")]
+
+    # Paso 3: Fetch ítems de factura con columnas de costo
+    items_table = _invoice_items_table()
+    fk_c = _invoice_items_fk_col()
+    product_id_c = _invoice_items_product_id_col()
+    qty_c = _invoice_items_qty_col()
+
+    purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
+    purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
+    purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
+
+    for c in (purchase_cost_c, purchase_cost_tax_c, purchase_vat_c):
+        if not _safe_sql_identifier(c):
+            raise ValueError(f"columna de costo de ítem inválida: {c!r}")
+
+    try:
+        chunk_sz = int(os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_INVOICE_ID_CHUNK", "80") or "80")
+    except ValueError:
+        chunk_sz = 80
+    chunk_sz = max(1, min(chunk_sz, 200))
+
+    item_select = f"{fk_c},{product_id_c},{qty_c},{purchase_cost_c},{purchase_cost_tax_c},{purchase_vat_c}"
+    all_items: list[dict[str, Any]] = []
+    product_ids_needed: set[Any] = set()
+
+    for i in range(0, len(invoice_ids), chunk_sz):
+        chunk = invoice_ids[i : i + chunk_sz]
+        start_inner = 0
+        while True:
+            try:
+                r_items = (
+                    client.table(items_table)
+                    .select(item_select)
+                    .in_(fk_c, chunk)
+                    .range(start_inner, start_inner + 999)
+                    .execute()
+                )
+            except Exception:
+                # Fallback si alguna columna de costo no existe en este deploy
+                r_items = (
+                    client.table(items_table)
+                    .select(f"{fk_c},{product_id_c},{qty_c},{purchase_cost_c}")
+                    .in_(fk_c, chunk)
+                    .range(start_inner, start_inner + 999)
+                    .execute()
+                )
+            rows_chunk: list[dict[str, Any]] = r_items.data or []
+            for row in rows_chunk:
+                all_items.append(row)
+                pid = row.get(product_id_c)
+                if pid:
+                    product_ids_needed.add(pid)
+            if len(rows_chunk) < 1000:
+                break
+            start_inner += 1000
+            if start_inner > 500_000:
+                break
+
+    # Paso 4: Obtener costo del producto como fallback
+    products_cost: dict[Any, dict[str, Any]] = {}
+    if product_ids_needed:
+        _, _, _, uuid_c = _product_table_columns()
+        if not uuid_c:
+            uuid_c = "id"
+        prod_cost_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_PRICE") or "cost_price").strip()
+        prod_cost_tax_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_INCLUDES_TAX") or "cost_price_includes_tax").strip()
+        prod_vat_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_VAT_RATE") or "vat_rate").strip()
+        prod_ids_list = list(product_ids_needed)
+        try:
+            prod_r = (
+                client.table(_products_table())
+                .select(f"{uuid_c},{prod_cost_col},{prod_cost_tax_col},{prod_vat_col}")
+                .in_(uuid_c, prod_ids_list)
+                .execute()
+            )
+            for p in (prod_r.data or []):
+                pid = p.get(uuid_c)
+                if pid:
+                    products_cost[pid] = {
+                        "cost_price": _to_float(p.get(prod_cost_col)),
+                        "cost_includes_tax": bool(p.get(prod_cost_tax_col)),
+                        "vat_rate": _to_float(p.get(prod_vat_col)),
+                    }
+        except Exception:
+            pass
+
+    # Paso 5: Calcular costo total con IVA (igual que useSalesReports.ts)
+    total_costo = 0.0
+    items_con_costo = 0
+    items_sin_costo = 0
+
+    for item in all_items:
+        qty = _to_float(item.get(qty_c))
+        raw_cost = item.get(purchase_cost_c)
+
+        if raw_cost is not None and raw_cost != "":
+            base_cost = _to_float(raw_cost)
+            includes_tax_raw = item.get(purchase_cost_tax_c)
+            includes_tax = bool(includes_tax_raw) if includes_tax_raw is not None else False
+            vat_rate = _to_float(item.get(purchase_vat_c))
+            items_con_costo += 1
+        else:
+            pid = item.get(product_id_c)
+            prod_info = products_cost.get(pid, {})
+            base_cost = prod_info.get("cost_price", 0.0)
+            includes_tax = prod_info.get("cost_includes_tax", False)
+            vat_rate = prod_info.get("vat_rate", 0.0)
+            if base_cost > 0:
+                items_con_costo += 1
+            else:
+                items_sin_costo += 1
+
+        tax_mult = 1.0 if includes_tax else (1.0 + vat_rate / 100.0)
+        total_costo += qty * base_cost * tax_mult
+
+    utilidad = total_ventas - total_costo
+    markup_pct = round((utilidad / total_costo) * 100, 2) if total_costo > 0 else 0.0
+    pct_utilidad_ventas = round((utilidad / total_ventas) * 100, 2) if total_ventas > 0 else 0.0
+
+    result: dict[str, Any] = {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "total_ventas": round(total_ventas, 2),
+        "total_costo_mercaderia": round(total_costo, 2),
+        "utilidad": round(utilidad, 2),
+        "markup_pct": markup_pct,
+        "pct_utilidad_sobre_ventas": pct_utilidad_ventas,
+        "cantidad_facturas": len(invoice_rows),
+        "items_procesados": len(all_items),
+        "items_con_costo_registrado": items_con_costo,
+        "items_sin_costo": items_sin_costo,
+        "fuente": "supabase",
+        "nota_metodologia": (
+            "Costo de mercadería c/ IVA (igual que el reporte del ERP). "
+            "Markup = Utilidad / Costo × 100. "
+            "% Utilidad = Utilidad / Venta × 100."
+        ),
+    }
+    if items_sin_costo > 0:
+        result["advertencia"] = (
+            f"{items_sin_costo} ítem(s) sin costo registrado ni cost_price en el producto "
+            "(no incluidos en el costo total; el margen puede estar sobreestimado)."
+        )
+    return result
+
+
 def _list_customer_invoice_items_from_supabase(invoice_id: str, limit: int) -> dict[str, Any]:
     client = _get_supabase()
     assert client is not None
@@ -2133,6 +2423,10 @@ def _stub_get_product_sales_units(query: str, desde: str, hasta: str) -> dict[st
                 "cantidad_vendida": 42.0,
                 "kg_vendidos": 42.0,
                 "monto_vendido": 21000.0,
+                "costo_mercaderia": 14700.0,
+                "utilidad": 6300.0,
+                "markup_pct": 42.9,
+                "pct_utilidad_ventas": 30.0,
                 "cantidad_ventas": 7,
             }
         ],
@@ -2185,13 +2479,16 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
 
     product_ids = list(product_map.keys())
 
-    # 2. Obtener sale_unit y unit_weight para calcular kg
+    # 2. Obtener sale_unit, unit_weight y columnas de costo del producto (fallback)
     sale_unit_c = _product_col_sale_unit()
     unit_weight_c = _product_col_unit_weight()
+    prod_cost_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_PRICE") or "cost_price").strip()
+    prod_cost_tax_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_INCLUDES_TAX") or "cost_price_includes_tax").strip()
+    prod_vat_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_VAT_RATE") or "vat_rate").strip()
     try:
         wp_r = (
             client.table(_products_table())
-            .select(f"{uuid_c},{sale_unit_c},{unit_weight_c}")
+            .select(f"{uuid_c},{sale_unit_c},{unit_weight_c},{prod_cost_col},{prod_cost_tax_col},{prod_vat_col}")
             .in_(uuid_c, product_ids)
             .execute()
         )
@@ -2200,9 +2497,25 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
             if pid in product_map:
                 product_map[pid]["sale_unit"] = (wp.get(sale_unit_c) or "").upper()
                 product_map[pid]["unit_weight"] = _to_float(wp.get(unit_weight_c))
+                product_map[pid]["cost_price"] = _to_float(wp.get(prod_cost_col))
+                product_map[pid]["cost_includes_tax"] = bool(wp.get(prod_cost_tax_col))
+                product_map[pid]["vat_rate"] = _to_float(wp.get(prod_vat_col))
     except Exception:
-        # Si las columnas no existen en este deploy, continuar sin info de peso
-        pass
+        # Si las columnas no existen en este deploy, continuar sin info de peso/costo
+        try:
+            wp_r = (
+                client.table(_products_table())
+                .select(f"{uuid_c},{sale_unit_c},{unit_weight_c}")
+                .in_(uuid_c, product_ids)
+                .execute()
+            )
+            for wp in (wp_r.data or []):
+                pid = wp.get(uuid_c)
+                if pid in product_map:
+                    product_map[pid]["sale_unit"] = (wp.get(sale_unit_c) or "").upper()
+                    product_map[pid]["unit_weight"] = _to_float(wp.get(unit_weight_c))
+        except Exception:
+            pass
 
     # 3. Obtener IDs de facturas válidas en el rango de fechas
     invoices_table = _invoices_table()
@@ -2257,12 +2570,16 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
             "fuente": "supabase",
         }
 
-    # 4. Agregar unidades, kg y conteo de ventas desde customer_invoice_items
+    # 4. Agregar unidades, kg, monto, costo y conteo de ventas desde customer_invoice_items
     items_table = _invoice_items_table()
     fk_c = _invoice_items_fk_col()
     product_id_c = _invoice_items_product_id_col()
     qty_c = _invoice_items_qty_col()
     amount_c = _invoice_items_amount_col()
+
+    purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
+    purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
+    purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
 
     try:
         chunk_sz = int(os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_INVOICE_ID_CHUNK", "80") or "80")
@@ -2271,22 +2588,36 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
     chunk_sz = max(1, min(chunk_sz, 200))
 
     agg: dict[Any, dict[str, Any]] = {
-        pid: {"cantidad_vendida": 0.0, "kg_vendidos": 0.0, "monto_vendido": 0.0, "_invoice_ids": set()}
+        pid: {"cantidad_vendida": 0.0, "kg_vendidos": 0.0, "monto_vendido": 0.0, "costo_total": 0.0, "_invoice_ids": set()}
         for pid in product_ids
     }
+
+    item_select_with_cost = f"{fk_c},{product_id_c},{qty_c},{amount_c},{purchase_cost_c},{purchase_cost_tax_c},{purchase_vat_c}"
+    item_select_base = f"{fk_c},{product_id_c},{qty_c},{amount_c}"
 
     for i in range(0, len(invoice_ids), chunk_sz):
         chunk = invoice_ids[i : i + chunk_sz]
         start_inner = 0
         while True:
-            r = (
-                client.table(items_table)
-                .select(f"{fk_c},{product_id_c},{qty_c},{amount_c}")
-                .in_(fk_c, chunk)
-                .in_(product_id_c, product_ids)
-                .range(start_inner, start_inner + page - 1)
-                .execute()
-            )
+            try:
+                r = (
+                    client.table(items_table)
+                    .select(item_select_with_cost)
+                    .in_(fk_c, chunk)
+                    .in_(product_id_c, product_ids)
+                    .range(start_inner, start_inner + page - 1)
+                    .execute()
+                )
+            except Exception:
+                # Fallback sin columnas de costo de ítem
+                r = (
+                    client.table(items_table)
+                    .select(item_select_base)
+                    .in_(fk_c, chunk)
+                    .in_(product_id_c, product_ids)
+                    .range(start_inner, start_inner + page - 1)
+                    .execute()
+                )
             rows = r.data or []
             for row in rows:
                 pid = row.get(product_id_c)
@@ -2295,7 +2626,7 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
                 raw_qty = _to_float(row.get(qty_c))
                 agg[pid]["cantidad_vendida"] += raw_qty
                 agg[pid]["monto_vendido"] += _to_float(row.get(amount_c))
-                # Calcular kg: misma lógica que BrandSalesReport.tsx
+                # Calcular kg
                 info = product_map[pid]
                 sale_unit = info.get("sale_unit", "")
                 unit_weight = info.get("unit_weight", 0.0)
@@ -2303,6 +2634,20 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
                     agg[pid]["kg_vendidos"] += raw_qty
                 elif unit_weight:
                     agg[pid]["kg_vendidos"] += raw_qty * unit_weight
+                # Calcular costo con IVA (igual que useSalesReports.ts)
+                raw_cost = row.get(purchase_cost_c)
+                if raw_cost is not None and raw_cost != "":
+                    base_cost = _to_float(raw_cost)
+                    includes_tax_raw = row.get(purchase_cost_tax_c)
+                    includes_tax = bool(includes_tax_raw) if includes_tax_raw is not None else False
+                    vat_rate = _to_float(row.get(purchase_vat_c))
+                else:
+                    # Fallback al cost_price del producto
+                    base_cost = info.get("cost_price", 0.0)
+                    includes_tax = info.get("cost_includes_tax", False)
+                    vat_rate = info.get("vat_rate", 0.0)
+                tax_mult = 1.0 if includes_tax else (1.0 + vat_rate / 100.0)
+                agg[pid]["costo_total"] += raw_qty * base_cost * tax_mult
                 # Trackear factura distinta
                 inv_id = row.get(fk_c)
                 if inv_id:
@@ -2313,19 +2658,27 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
             if start_inner > 500_000:
                 break
 
-    # Construir resultado final
-    result_list = [
-        {
+    # Construir resultado final con costo y margen
+    result_list = []
+    for pid in product_ids:
+        monto = agg[pid]["monto_vendido"]
+        costo = round(agg[pid]["costo_total"], 2)
+        utilidad = round(monto - costo, 2)
+        markup_pct = round((utilidad / costo) * 100, 2) if costo > 0 else 0.0
+        pct_utilidad = round((utilidad / monto) * 100, 2) if monto > 0 else 0.0
+        result_list.append({
             "nombre": product_map[pid]["nombre"],
             "sku_o_codigo": product_map[pid]["sku_o_codigo"],
             "sale_unit": product_map[pid]["sale_unit"],
             "cantidad_vendida": agg[pid]["cantidad_vendida"],
             "kg_vendidos": round(agg[pid]["kg_vendidos"], 3),
-            "monto_vendido": agg[pid]["monto_vendido"],
+            "monto_vendido": round(monto, 2),
+            "costo_mercaderia": costo,
+            "utilidad": utilidad,
+            "markup_pct": markup_pct,
+            "pct_utilidad_ventas": pct_utilidad,
             "cantidad_ventas": len(agg[pid]["_invoice_ids"]),
-        }
-        for pid in product_ids
-    ]
+        })
     result_list.sort(key=lambda x: x["cantidad_vendida"], reverse=True)
 
     return {
@@ -2335,6 +2688,7 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
         "cantidad_productos_encontrados": len(result_list),
         "fuente": "supabase",
         "tabla_items": items_table,
+        "nota_costo": "Costo de mercadería c/ IVA (desde purchase_cost del ítem o cost_price del producto). Markup = Utilidad / Costo × 100.",
     }
 
 
@@ -2601,6 +2955,10 @@ def _stub_top_selling_products(desde: str, hasta: str, limit: int) -> dict[str, 
             "nombre": "Producto demo A",
             "cantidad_vendida": 120.0,
             "monto_vendido": 450000.0,
+            "costo_mercaderia_estimado": 315000.0,
+            "utilidad_estimada": 135000.0,
+            "markup_pct": 42.9,
+            "pct_utilidad_ventas": 30.0,
         },
         {
             "product_id": "demo-prod-2",
@@ -2608,6 +2966,10 @@ def _stub_top_selling_products(desde: str, hasta: str, limit: int) -> dict[str, 
             "nombre": "Producto demo B",
             "cantidad_vendida": 95.0,
             "monto_vendido": 330000.0,
+            "costo_mercaderia_estimado": 231000.0,
+            "utilidad_estimada": 99000.0,
+            "markup_pct": 42.9,
+            "pct_utilidad_ventas": 30.0,
         },
     ]
     return {
@@ -2616,6 +2978,7 @@ def _stub_top_selling_products(desde: str, hasta: str, limit: int) -> dict[str, 
         "cantidad_devuelta": min(len(demo), limit),
         "limite": limit,
         "fuente": "stub",
+        "nota_costo": "Costo estimado basado en cost_price actual del producto (c/ IVA). Para margen exacto usar el Reporte de Rentabilidad del ERP.",
         "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para leer Postgres",
     }
 
@@ -2695,12 +3058,29 @@ def _top_selling_products_from_supabase(desde: str, hasta: str, limit: int) -> d
     ids = list(agg.keys())
     code_c, name_c, _, uuid_c = _product_table_columns()
     by_id: dict[Any, dict[str, Any]] = {}
+
+    # Columnas de costo del producto (fallback para estimación de margen)
+    prod_cost_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_PRICE") or "cost_price").strip()
+    prod_cost_tax_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_INCLUDES_TAX") or "cost_price_includes_tax").strip()
+    prod_vat_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_VAT_RATE") or "vat_rate").strip()
+
     if uuid_c and ids:
-        for i in range(0, len(ids), 200):
-            chunk = ids[i : i + 200]
-            r = client.table(_products_table()).select(f"{uuid_c},{code_c},{name_c}").in_(uuid_c, chunk).execute()
-            for prow in r.data or []:
-                by_id[prow.get(uuid_c)] = prow
+        prod_select = f"{uuid_c},{code_c},{name_c}"
+        try:
+            # Intentar traer también columnas de costo
+            prod_select_cost = f"{prod_select},{prod_cost_col},{prod_cost_tax_col},{prod_vat_col}"
+            for i in range(0, len(ids), 200):
+                chunk = ids[i : i + 200]
+                r = client.table(_products_table()).select(prod_select_cost).in_(uuid_c, chunk).execute()
+                for prow in r.data or []:
+                    by_id[prow.get(uuid_c)] = prow
+        except Exception:
+            # Fallback sin columnas de costo
+            for i in range(0, len(ids), 200):
+                chunk = ids[i : i + 200]
+                r = client.table(_products_table()).select(prod_select).in_(uuid_c, chunk).execute()
+                for prow in r.data or []:
+                    by_id[prow.get(uuid_c)] = prow
 
     ranked = sorted(
         agg.items(),
@@ -2709,13 +3089,30 @@ def _top_selling_products_from_supabase(desde: str, hasta: str, limit: int) -> d
     out: list[dict[str, Any]] = []
     for pid, vals in ranked[:limit]:
         p = by_id.get(pid, {})
+        cantidad = vals["cantidad_vendida"]
+        monto = vals["monto_vendido"]
+
+        # Estimación de costo con IVA usando cost_price del producto
+        base_cost = _to_float(p.get(prod_cost_col))
+        includes_tax = bool(p.get(prod_cost_tax_col))
+        vat_rate = _to_float(p.get(prod_vat_col))
+        tax_mult = 1.0 if includes_tax else (1.0 + vat_rate / 100.0)
+        costo_estimado = round(cantidad * base_cost * tax_mult, 2)
+        utilidad_estimada = round(monto - costo_estimado, 2)
+        markup_pct = round((utilidad_estimada / costo_estimado) * 100, 2) if costo_estimado > 0 else 0.0
+        pct_utilidad = round((utilidad_estimada / monto) * 100, 2) if monto > 0 else 0.0
+
         out.append(
             {
                 "product_id": pid,
                 "sku_o_codigo": p.get(code_c),
                 "nombre": p.get(name_c),
-                "cantidad_vendida": round(vals["cantidad_vendida"], 3),
-                "monto_vendido": round(vals["monto_vendido"], 2),
+                "cantidad_vendida": round(cantidad, 3),
+                "monto_vendido": round(monto, 2),
+                "costo_mercaderia_estimado": costo_estimado,
+                "utilidad_estimada": utilidad_estimada,
+                "markup_pct": markup_pct,
+                "pct_utilidad_ventas": pct_utilidad,
             }
         )
 
@@ -2726,6 +3123,10 @@ def _top_selling_products_from_supabase(desde: str, hasta: str, limit: int) -> d
         "limite": limit,
         "fuente": "supabase",
         "tabla_items": items_t,
+        "nota_costo": (
+            "Costo estimado basado en el cost_price actual del producto (c/ IVA). "
+            "Para un ranking por ganancia exacta, usar el Reporte de Rentabilidad del ERP."
+        ),
     }
 
 
@@ -4492,6 +4893,23 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _get_invoice_summary_from_supabase(desde, hasta, filter_cid)
             else:
                 result = _stub_get_invoice_summary(desde, hasta)
+        elif name == "get_profit_margin_summary":
+            desde, hasta = str(args["desde"]), str(args["hasta"])
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", desde) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", hasta):
+                return json.dumps({"error": "fechas deben ser YYYY-MM-DD"}, ensure_ascii=False)
+            filter_cid = None
+            if use_sb:
+                cid_raw = str(args.get("customer_id") or "").strip()
+                cname_raw = str(args.get("customer_name") or "").strip()
+                if cid_raw:
+                    filter_cid = cid_raw
+                elif cname_raw:
+                    filter_cid = _resolve_customer_id_by_name(cname_raw)
+                    if not filter_cid:
+                        return json.dumps({"error": f"No se encontró cliente: {cname_raw!r}"}, ensure_ascii=False)
+                result = _get_profit_margin_from_supabase(desde, hasta, filter_cid)
+            else:
+                result = _stub_get_profit_margin(desde, hasta)
         elif name == "list_customer_invoice_items":
             lim = _coerce_limit(args.get("limit"), default=100, cap=500)
             inv_id = str(args.get("invoice_id") or "").strip()
