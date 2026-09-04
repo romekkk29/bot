@@ -4241,7 +4241,15 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     orders_table = _orders_list_table()
     seller_col = _orders_seller_col()
 
-    # Paso 1: IDs que son destino de conversión (ci.id NOT IN converted_to_invoice_id)
+    items_t = _invoice_items_table()
+    fk_c = _invoice_items_fk_col()
+    product_id_c = _invoice_items_product_id_col()
+    qty_c = _invoice_items_qty_col()
+    purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
+    purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
+    purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
+
+    # Paso 1: IDs que son destino de conversión
     page = 1000
     excluded_ids: set[str] = set()
     try:
@@ -4267,41 +4275,73 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     except Exception:
         pass
 
-    # Paso 2: paginar facturas con filtros de fecha y estado (igual que validInvoices del front)
+    # Paso 2: Traer facturas CON sus ítems en un solo query (embedded select de Supabase/PostgREST).
+    # Esto evita el N+1 de chunks de ítems: cada página de facturas ya trae sus líneas de costo.
     excluded_statuses = ["cancelled", "voided", "converted", "draft"]
     excluded_types = {"nota_pedido", "np"}
-    page = 1000
+    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+
+    nested_cols = f"{product_id_c},{qty_c},{purchase_cost_c},{purchase_cost_tax_c},{purchase_vat_c}"
+    nested_select = f"{items_t}({nested_cols})"
+    invoice_select = f"id,{amount_c},created_by,sales_order_id,warehouse_id,payment_condition,invoice_type,{nested_select}"
+
     start = 0
     inv_rows: list[dict[str, Any]] = []
-
-    desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
-    while True:
-        r = (
-            client.table(table)
-            .select(f"id,{amount_c},created_by,sales_order_id,warehouse_id,payment_condition,invoice_type")
-            .gte(date_c, desde_filtro)
-            .lte(date_c, hasta_filtro)
-            .not_.in_("status", excluded_statuses)
-            .order("id")
-            .range(start, start + page - 1)
-            .execute()
-        )
-        rows: list[dict[str, Any]] = r.data or []
-        for row in rows:
-            if row.get("id") in excluded_ids:
-                continue
-            inv_type = (row.get("invoice_type") or "").lower()
-            if inv_type in excluded_types:
-                continue
-            # Al menos uno de estos campos debe estar presente (igual que validInvoices del front)
-            if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
-                continue
-            inv_rows.append(row)
-        if len(rows) < page:
-            break
-        start += page
-        if start > 500_000:
-            break
+    try:
+        while True:
+            r = (
+                client.table(table)
+                .select(invoice_select)
+                .gte(date_c, desde_filtro)
+                .lte(date_c, hasta_filtro)
+                .not_.in_("status", excluded_statuses)
+                .order("id")
+                .range(start, start + page - 1)
+                .execute()
+            )
+            rows: list[dict[str, Any]] = r.data or []
+            for row in rows:
+                if row.get("id") in excluded_ids:
+                    continue
+                if (row.get("invoice_type") or "").lower() in excluded_types:
+                    continue
+                if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
+                    continue
+                inv_rows.append(row)
+            if len(rows) < page:
+                break
+            start += page
+            if start > 500_000:
+                break
+    except Exception:
+        # Fallback: si el embedded select falla (FK no detectada por PostgREST), traer solo facturas
+        inv_rows = []
+        start = 0
+        while True:
+            r = (
+                client.table(table)
+                .select(f"id,{amount_c},created_by,sales_order_id,warehouse_id,payment_condition,invoice_type")
+                .gte(date_c, desde_filtro)
+                .lte(date_c, hasta_filtro)
+                .not_.in_("status", excluded_statuses)
+                .order("id")
+                .range(start, start + page - 1)
+                .execute()
+            )
+            rows = r.data or []
+            for row in rows:
+                if row.get("id") in excluded_ids:
+                    continue
+                if (row.get("invoice_type") or "").lower() in excluded_types:
+                    continue
+                if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
+                    continue
+                inv_rows.append(row)
+            if len(rows) < page:
+                break
+            start += page
+            if start > 500_000:
+                break
 
     # Paso 3: resolver so.created_by para facturas con sales_order_id (COALESCE)
     so_seller: dict[str, str] = {}
@@ -4314,10 +4354,10 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
                 if srow.get(seller_col):
                     so_seller[srow["id"]] = srow[seller_col]
 
-    # Paso 4: agregar por vendedor efectivo → COALESCE(so.created_by, ci.created_by)
-    # También construimos invoice_to_seller para atribuir costos de ítems por vendedor
-    invoice_to_seller: dict[str, Any] = {}
+    # Paso 4: agregar por vendedor; los ítems ya vienen embedded en cada factura
     agg: dict[Any, dict[str, Any]] = {}
+    product_ids_needed: set[Any] = set()
+
     for row in inv_rows:
         so_id = row.get("sales_order_id")
         sid = (so_id and so_seller.get(so_id)) or row.get("created_by")
@@ -4326,96 +4366,62 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
         cur = agg.setdefault(sid, {"total_facturado": 0.0, "cantidad_facturas": 0, "costo_total": 0.0})
         cur["total_facturado"] += _to_float(row.get(amount_c))
         cur["cantidad_facturas"] += 1
-        if row.get("id"):
-            invoice_to_seller[row["id"]] = sid
 
-    # Paso 4.5: calcular costo de mercadería por vendedor desde customer_invoice_items
-    all_inv_ids = list(invoice_to_seller.keys())
-    if all_inv_ids:
-        items_table = _invoice_items_table()
-        fk_c = _invoice_items_fk_col()
-        product_id_c = _invoice_items_product_id_col()
-        qty_c = _invoice_items_qty_col()
-        purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
-        purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
-        purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
-        try:
-            chunk_sz = int(os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_INVOICE_ID_CHUNK", "80") or "80")
-        except ValueError:
-            chunk_sz = 80
-        chunk_sz = max(1, min(chunk_sz, 200))
-
-        item_select = f"{fk_c},{product_id_c},{qty_c},{purchase_cost_c},{purchase_cost_tax_c},{purchase_vat_c}"
-        raw_items: list[dict[str, Any]] = []
-        product_ids_needed: set[Any] = set()
-
-        for i in range(0, len(all_inv_ids), chunk_sz):
-            chunk = all_inv_ids[i : i + chunk_sz]
-            i_start = 0
-            while True:
-                try:
-                    r_i = client.table(items_table).select(item_select).in_(fk_c, chunk).range(i_start, i_start + 999).execute()
-                except Exception:
-                    r_i = client.table(items_table).select(f"{fk_c},{product_id_c},{qty_c},{purchase_cost_c}").in_(fk_c, chunk).range(i_start, i_start + 999).execute()
-                rows_i: list[dict[str, Any]] = r_i.data or []
-                for row in rows_i:
-                    raw_items.append(row)
-                    pid = row.get(product_id_c)
-                    if pid and (row.get(purchase_cost_c) is None or row.get(purchase_cost_c) == ""):
-                        product_ids_needed.add(pid)
-                if len(rows_i) < 1000:
-                    break
-                i_start += 1000
-                if i_start > 500_000:
-                    break
-
-        # Fallback: costo del producto cuando el ítem no tiene purchase_cost
-        products_cost: dict[Any, dict[str, Any]] = {}
-        if product_ids_needed:
-            _, _, _, uuid_c = _product_table_columns()
-            if not uuid_c:
-                uuid_c = "id"
-            prod_cost_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_PRICE") or "cost_price").strip()
-            prod_cost_tax_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_INCLUDES_TAX") or "cost_price_includes_tax").strip()
-            prod_vat_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_VAT_RATE") or "vat_rate").strip()
-            try:
-                prod_r = (
-                    client.table(_products_table())
-                    .select(f"{uuid_c},{prod_cost_col},{prod_cost_tax_col},{prod_vat_col}")
-                    .in_(uuid_c, list(product_ids_needed))
-                    .execute()
-                )
-                for p in (prod_r.data or []):
-                    p_id = p.get(uuid_c)
-                    if p_id:
-                        products_cost[p_id] = {
-                            "cost_price": _to_float(p.get(prod_cost_col)),
-                            "cost_includes_tax": bool(p.get(prod_cost_tax_col)),
-                            "vat_rate": _to_float(p.get(prod_vat_col)),
-                        }
-            except Exception:
-                pass
-
-        # Atribuir costo a cada vendedor (misma fórmula que useSalesReports.ts)
-        for item in raw_items:
-            inv_id = item.get(fk_c)
-            seller_id = invoice_to_seller.get(inv_id)
-            if seller_id is None or seller_id not in agg:
-                continue
+        for item in (row.get(items_t) or []):
             qty = _to_float(item.get(qty_c))
             raw_cost = item.get(purchase_cost_c)
             if raw_cost is not None and raw_cost != "":
                 base_cost = _to_float(raw_cost)
-                includes_tax_raw = item.get(purchase_cost_tax_c)
-                includes_tax = bool(includes_tax_raw) if includes_tax_raw is not None else False
+                includes_tax = bool(item.get(purchase_cost_tax_c)) if item.get(purchase_cost_tax_c) is not None else False
                 vat_rate = _to_float(item.get(purchase_vat_c))
+                tax_mult = 1.0 if includes_tax else (1.0 + vat_rate / 100.0)
+                cur["costo_total"] += qty * base_cost * tax_mult
             else:
-                prod_info = products_cost.get(item.get(product_id_c), {})
+                pid = item.get(product_id_c)
+                if pid:
+                    product_ids_needed.add(pid)
+                    # Guardamos el item para procesarlo tras traer el producto
+                    cur.setdefault("_pending_items", []).append({"pid": pid, "qty": qty, "sid": sid})
+
+    # Paso 4.5: fallback de cost_price del producto para ítems sin purchase_cost (una sola query)
+    if product_ids_needed:
+        _, _, _, uuid_c = _product_table_columns()
+        if not uuid_c:
+            uuid_c = "id"
+        prod_cost_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_PRICE") or "cost_price").strip()
+        prod_cost_tax_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_INCLUDES_TAX") or "cost_price_includes_tax").strip()
+        prod_vat_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_VAT_RATE") or "vat_rate").strip()
+        products_cost: dict[Any, dict[str, Any]] = {}
+        try:
+            prod_r = (
+                client.table(_products_table())
+                .select(f"{uuid_c},{prod_cost_col},{prod_cost_tax_col},{prod_vat_col}")
+                .in_(uuid_c, list(product_ids_needed))
+                .execute()
+            )
+            for p in (prod_r.data or []):
+                p_id = p.get(uuid_c)
+                if p_id:
+                    products_cost[p_id] = {
+                        "cost_price": _to_float(p.get(prod_cost_col)),
+                        "cost_includes_tax": bool(p.get(prod_cost_tax_col)),
+                        "vat_rate": _to_float(p.get(prod_vat_col)),
+                    }
+        except Exception:
+            products_cost = {}
+
+        for sid_key, vals in agg.items():
+            for pending in vals.pop("_pending_items", []):
+                prod_info = products_cost.get(pending["pid"], {})
                 base_cost = prod_info.get("cost_price", 0.0)
                 includes_tax = prod_info.get("cost_includes_tax", False)
                 vat_rate = prod_info.get("vat_rate", 0.0)
-            tax_mult = 1.0 if includes_tax else (1.0 + vat_rate / 100.0)
-            agg[seller_id]["costo_total"] += qty * base_cost * tax_mult
+                tax_mult = 1.0 if includes_tax else (1.0 + vat_rate / 100.0)
+                vals["costo_total"] += pending["qty"] * base_cost * tax_mult
+    else:
+        # Limpiar _pending_items si no hubo productos que buscar
+        for vals in agg.values():
+            vals.pop("_pending_items", None)
 
     # Paso 5: resolver nombres desde profiles
     profiles_t = _profiles_table()
@@ -5110,10 +5116,25 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
             metric = str(args.get("metric") or "monto").strip().lower()
             if metric not in ("monto", "cantidad"):
                 metric = "monto"
+            # Default: mes actual (1° del mes → hoy) en lugar de los últimos 90 días
+            _desde_raw = args.get("desde")
+            _hasta_raw = args.get("hasta")
+            if not _desde_raw and not _hasta_raw:
+                _today = date.today()
+                _desde_raw = _today.replace(day=1).isoformat()
+                _hasta_raw = _today.isoformat()
             try:
-                desde, hasta = _resolve_orders_list_dates(args.get("desde"), args.get("hasta"))
+                desde, hasta = _resolve_orders_list_dates(_desde_raw, _hasta_raw)
             except ValueError as e:
                 return json.dumps({"error": str(e)}, ensure_ascii=False)
+            # Tope de 62 días para evitar timeouts (el embedded select es eficiente pero tiene límites)
+            if (date.fromisoformat(hasta) - date.fromisoformat(desde)).days > 62:
+                return json.dumps({
+                    "error": (
+                        f"El período solicitado ({desde} → {hasta}) supera los 62 días permitidos. "
+                        "Usá un rango más corto, por ejemplo el mes actual o un mes específico."
+                    )
+                }, ensure_ascii=False)
             if use_sb:
                 result = _top_sellers_by_invoicing_from_supabase(desde, hasta, metric, lim)
             else:
