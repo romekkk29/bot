@@ -2580,6 +2580,8 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
     purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
     purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
     purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
+    # tax_amount: IVA por línea — igual que el ERP: Venta Final = line_total + tax_amount
+    tax_amount_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_TAX_AMOUNT_COL") or "tax_amount").strip()
 
     try:
         chunk_sz = int(os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_INVOICE_ID_CHUNK", "80") or "80")
@@ -2592,8 +2594,8 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
         for pid in product_ids
     }
 
-    item_select_with_cost = f"{fk_c},{product_id_c},{qty_c},{amount_c},{purchase_cost_c},{purchase_cost_tax_c},{purchase_vat_c}"
-    item_select_base = f"{fk_c},{product_id_c},{qty_c},{amount_c}"
+    item_select_with_cost = f"{fk_c},{product_id_c},{qty_c},{amount_c},{tax_amount_c},{purchase_cost_c},{purchase_cost_tax_c},{purchase_vat_c}"
+    item_select_base = f"{fk_c},{product_id_c},{qty_c},{amount_c},{tax_amount_c}"
 
     for i in range(0, len(invoice_ids), chunk_sz):
         chunk = invoice_ids[i : i + chunk_sz]
@@ -2625,7 +2627,8 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
                     continue
                 raw_qty = _to_float(row.get(qty_c))
                 agg[pid]["cantidad_vendida"] += raw_qty
-                agg[pid]["monto_vendido"] += _to_float(row.get(amount_c))
+                # Venta Final c/ IVA = line_total + tax_amount (igual que el ERP)
+                agg[pid]["monto_vendido"] += _to_float(row.get(amount_c)) + _to_float(row.get(tax_amount_c))
                 # Calcular kg
                 info = product_map[pid]
                 sale_unit = info.get("sale_unit", "")
