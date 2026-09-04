@@ -825,9 +825,11 @@ TOOLS: list[dict[str, Any]] = [
             "name": "get_top_sellers_by_invoicing",
             "description": (
                 "Ranking de VENDEDORES (no clientes) basado en FACTURACIÓN REAL (customer_invoices: FA, FB, remito). "
-                "Solo incluye comprobantes ya emitidos (productos facturados, en camino o entregados). "
+                "Solo incluye comprobantes ya emitidos. "
+                "Devuelve por vendedor: total_facturado, costo_mercaderia (c/ IVA), utilidad, markup_pct y pct_utilidad_ventas. "
                 "Usar cuando pregunten: 'quién más facturó', 'vendedor con mayor facturación', "
-                "'ranking por facturas emitidas', 'facturación real por vendedor', 'facturación de un vendedor'. "
+                "'qué vendedor genera más rentabilidad', 'qué vendedor deja más ganancia', "
+                "'ranking de vendedores por ganancia', 'facturación real por vendedor'. "
                 "Si el usuario nombra un vendedor específico, usar limit alto (hasta 50) para poder ubicarlo en el ranking. "
                 "NO usar para órdenes de venta pendientes: para eso usar get_top_sellers. "
                 "NO usar si el usuario pregunta por CLIENTES: para eso usar get_top_customers_by_invoicing."
@@ -4199,9 +4201,24 @@ def _recent_product_movements_from_supabase(query: str, days: int, limit: int) -
 
 def _stub_top_sellers_by_invoicing(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
     demo = [
-        {"user_id": "demo-user-1", "nombre": "Ana Gómez", "total_facturado": 720000.0, "cantidad_facturas": 10},
-        {"user_id": "demo-user-2", "nombre": "Carlos Pérez", "total_facturado": 580000.0, "cantidad_facturas": 8},
-        {"user_id": "demo-user-3", "nombre": "María López", "total_facturado": 390000.0, "cantidad_facturas": 6},
+        {
+            "user_id": "demo-user-1", "nombre": "Ana Gómez",
+            "total_facturado": 720000.0, "costo_mercaderia": 504000.0,
+            "utilidad": 216000.0, "markup_pct": 42.9, "pct_utilidad_ventas": 30.0,
+            "cantidad_facturas": 10,
+        },
+        {
+            "user_id": "demo-user-2", "nombre": "Carlos Pérez",
+            "total_facturado": 580000.0, "costo_mercaderia": 406000.0,
+            "utilidad": 174000.0, "markup_pct": 42.9, "pct_utilidad_ventas": 30.0,
+            "cantidad_facturas": 8,
+        },
+        {
+            "user_id": "demo-user-3", "nombre": "María López",
+            "total_facturado": 390000.0, "costo_mercaderia": 273000.0,
+            "utilidad": 117000.0, "markup_pct": 42.9, "pct_utilidad_ventas": 30.0,
+            "cantidad_facturas": 6,
+        },
     ]
     return {
         "periodo": {"desde": desde, "hasta": hasta},
@@ -4210,6 +4227,7 @@ def _stub_top_sellers_by_invoicing(desde: str, hasta: str, metric: str, limit: i
         "cantidad_devuelta": min(len(demo), limit),
         "limite": limit,
         "fuente": "stub",
+        "nota_costo": "Costo de mercadería c/ IVA. Markup = Utilidad / Costo × 100.",
         "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para leer Postgres",
     }
 
@@ -4297,15 +4315,107 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
                     so_seller[srow["id"]] = srow[seller_col]
 
     # Paso 4: agregar por vendedor efectivo → COALESCE(so.created_by, ci.created_by)
-    agg: dict[Any, dict[str, float]] = {}
+    # También construimos invoice_to_seller para atribuir costos de ítems por vendedor
+    invoice_to_seller: dict[str, Any] = {}
+    agg: dict[Any, dict[str, Any]] = {}
     for row in inv_rows:
         so_id = row.get("sales_order_id")
         sid = (so_id and so_seller.get(so_id)) or row.get("created_by")
         if sid is None:
             continue
-        cur = agg.setdefault(sid, {"total_facturado": 0.0, "cantidad_facturas": 0})
+        cur = agg.setdefault(sid, {"total_facturado": 0.0, "cantidad_facturas": 0, "costo_total": 0.0})
         cur["total_facturado"] += _to_float(row.get(amount_c))
         cur["cantidad_facturas"] += 1
+        if row.get("id"):
+            invoice_to_seller[row["id"]] = sid
+
+    # Paso 4.5: calcular costo de mercadería por vendedor desde customer_invoice_items
+    all_inv_ids = list(invoice_to_seller.keys())
+    if all_inv_ids:
+        items_table = _invoice_items_table()
+        fk_c = _invoice_items_fk_col()
+        product_id_c = _invoice_items_product_id_col()
+        qty_c = _invoice_items_qty_col()
+        purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
+        purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
+        purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
+        try:
+            chunk_sz = int(os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_INVOICE_ID_CHUNK", "80") or "80")
+        except ValueError:
+            chunk_sz = 80
+        chunk_sz = max(1, min(chunk_sz, 200))
+
+        item_select = f"{fk_c},{product_id_c},{qty_c},{purchase_cost_c},{purchase_cost_tax_c},{purchase_vat_c}"
+        raw_items: list[dict[str, Any]] = []
+        product_ids_needed: set[Any] = set()
+
+        for i in range(0, len(all_inv_ids), chunk_sz):
+            chunk = all_inv_ids[i : i + chunk_sz]
+            i_start = 0
+            while True:
+                try:
+                    r_i = client.table(items_table).select(item_select).in_(fk_c, chunk).range(i_start, i_start + 999).execute()
+                except Exception:
+                    r_i = client.table(items_table).select(f"{fk_c},{product_id_c},{qty_c},{purchase_cost_c}").in_(fk_c, chunk).range(i_start, i_start + 999).execute()
+                rows_i: list[dict[str, Any]] = r_i.data or []
+                for row in rows_i:
+                    raw_items.append(row)
+                    pid = row.get(product_id_c)
+                    if pid and (row.get(purchase_cost_c) is None or row.get(purchase_cost_c) == ""):
+                        product_ids_needed.add(pid)
+                if len(rows_i) < 1000:
+                    break
+                i_start += 1000
+                if i_start > 500_000:
+                    break
+
+        # Fallback: costo del producto cuando el ítem no tiene purchase_cost
+        products_cost: dict[Any, dict[str, Any]] = {}
+        if product_ids_needed:
+            _, _, _, uuid_c = _product_table_columns()
+            if not uuid_c:
+                uuid_c = "id"
+            prod_cost_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_PRICE") or "cost_price").strip()
+            prod_cost_tax_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_INCLUDES_TAX") or "cost_price_includes_tax").strip()
+            prod_vat_col = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_VAT_RATE") or "vat_rate").strip()
+            try:
+                prod_r = (
+                    client.table(_products_table())
+                    .select(f"{uuid_c},{prod_cost_col},{prod_cost_tax_col},{prod_vat_col}")
+                    .in_(uuid_c, list(product_ids_needed))
+                    .execute()
+                )
+                for p in (prod_r.data or []):
+                    p_id = p.get(uuid_c)
+                    if p_id:
+                        products_cost[p_id] = {
+                            "cost_price": _to_float(p.get(prod_cost_col)),
+                            "cost_includes_tax": bool(p.get(prod_cost_tax_col)),
+                            "vat_rate": _to_float(p.get(prod_vat_col)),
+                        }
+            except Exception:
+                pass
+
+        # Atribuir costo a cada vendedor (misma fórmula que useSalesReports.ts)
+        for item in raw_items:
+            inv_id = item.get(fk_c)
+            seller_id = invoice_to_seller.get(inv_id)
+            if seller_id is None or seller_id not in agg:
+                continue
+            qty = _to_float(item.get(qty_c))
+            raw_cost = item.get(purchase_cost_c)
+            if raw_cost is not None and raw_cost != "":
+                base_cost = _to_float(raw_cost)
+                includes_tax_raw = item.get(purchase_cost_tax_c)
+                includes_tax = bool(includes_tax_raw) if includes_tax_raw is not None else False
+                vat_rate = _to_float(item.get(purchase_vat_c))
+            else:
+                prod_info = products_cost.get(item.get(product_id_c), {})
+                base_cost = prod_info.get("cost_price", 0.0)
+                includes_tax = prod_info.get("cost_includes_tax", False)
+                vat_rate = prod_info.get("vat_rate", 0.0)
+            tax_mult = 1.0 if includes_tax else (1.0 + vat_rate / 100.0)
+            agg[seller_id]["costo_total"] += qty * base_cost * tax_mult
 
     # Paso 5: resolver nombres desde profiles
     profiles_t = _profiles_table()
@@ -4324,10 +4434,19 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     ranked = sorted(agg.items(), key=lambda kv: -kv[1][sort_key])
     out: list[dict[str, Any]] = []
     for sid, vals in ranked[:limit]:
+        facturado = vals["total_facturado"]
+        costo = round(vals["costo_total"], 2)
+        utilidad = round(facturado - costo, 2)
+        markup_pct = round((utilidad / costo) * 100, 2) if costo > 0 else 0.0
+        pct_utilidad = round((utilidad / facturado) * 100, 2) if facturado > 0 else 0.0
         out.append({
             "user_id": sid,
             "nombre": names.get(sid) or str(sid),
-            "total_facturado": round(vals["total_facturado"], 2),
+            "total_facturado": round(facturado, 2),
+            "costo_mercaderia": costo,
+            "utilidad": utilidad,
+            "markup_pct": markup_pct,
+            "pct_utilidad_ventas": pct_utilidad,
             "cantidad_facturas": vals["cantidad_facturas"],
         })
 
@@ -4339,6 +4458,7 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
         "limite": limit,
         "fuente": "supabase",
         "tabla": table,
+        "nota_costo": "Costo de mercadería c/ IVA (purchase_cost del ítem o cost_price del producto). Markup = Utilidad / Costo × 100.",
     }
 
 

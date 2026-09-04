@@ -250,6 +250,12 @@ Cuando el usuario pregunte "qué producto me deja más ganancia", "cuánto gano 
 - Si pregunta por un RANKING de los más vendidos con su ganancia: usá `get_top_selling_products` — incluye estimación de margen (basado en cost_price actual del producto). Aclará siempre que el margen es una ESTIMACIÓN y que para ver el ranking exacto por ganancia puede ingresar al Reporte de Rentabilidad del ERP.
 - NO uses `get_profit_margin_summary` para consultas por producto individual; esa tool da el total del período, no por producto.
 
+CONCEPTO CLAVE — Rentabilidad por vendedor:
+Cuando el usuario pregunte "qué vendedor genera más rentabilidad/ganancia", "margen por vendedor", "quién vende más caro/mejor":
+- Usá `get_top_sellers_by_invoicing` — ahora incluye costo_mercaderia (c/ IVA), utilidad, markup_pct y pct_utilidad_ventas por vendedor.
+- El costo se calcula igual que el reporte del ERP: purchase_cost del ítem de factura (o cost_price del producto como fallback).
+- Al responder, mostrá la ganancia y el markup junto con el total facturado para dar contexto completo.
+
 CONCEPTO CLAVE — Ventas vs Órdenes de venta:
 Para el usuario, "VENTAS" equivale a FACTURACIÓN (customer_invoices): comprobantes emitidos (FA, FB, remito); representan lo que ya fue facturado, en camino o entregado.
 "ÓRDENES DE VENTA" u "OV" son sales_orders: registradas por vendedores, pueden estar pendientes de facturación o entrega.
