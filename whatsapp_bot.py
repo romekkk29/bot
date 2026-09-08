@@ -20,7 +20,8 @@ from pydantic import BaseModel, Field
 
 from tools import (
     TOOLS, data_backend_label, dispatch_tool, _get_supabase,
-    _get_supabase_for_key, set_request_supabase, _request_supabase_override,
+    _get_supabase_for_key, set_request_supabase, set_request_db_key,
+    _request_supabase_override, _request_db_key,
 )
 
 # Cargar variables de entorno
@@ -736,6 +737,7 @@ async def api_chat(req: ChatRequest, request: Request):
 
     # --- Resolución de base de datos (multi-tenant) ---
     db_token = None
+    db_key_token = None
     if req.db_key:
         tenant_client = _get_supabase_for_key(req.db_key)
         if tenant_client is None:
@@ -747,6 +749,7 @@ async def api_chat(req: ChatRequest, request: Request):
                 user=None,
             )
         db_token = set_request_supabase(tenant_client)
+        db_key_token = set_request_db_key(req.db_key)
         print(f"[API/CHAT] Usando db_key={req.db_key.upper()!r}", file=sys.stderr)
     else:
         # Sin db_key: usa cliente global (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)
@@ -812,6 +815,8 @@ async def api_chat(req: ChatRequest, request: Request):
     finally:
         if db_token is not None:
             _request_supabase_override.reset(db_token)
+        if db_key_token is not None:
+            _request_db_key.reset(db_key_token)
 
     return ChatResponse(
         reply=reply,

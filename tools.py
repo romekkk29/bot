@@ -959,6 +959,7 @@ TOOLS: list[dict[str, Any]] = [
 
 # ContextVar para override por request (multi-tenant, async-safe)
 _request_supabase_override: ContextVar[Any | None] = ContextVar("_request_supabase_override", default=None)
+_request_db_key: ContextVar[str | None] = ContextVar("_request_db_key", default=None)
 
 # Caché de clientes por db_key
 _supabase_client_by_key: dict[str, Any] = {}
@@ -998,6 +999,34 @@ def set_request_supabase(client: Any | None):
     Retorna el Token para poder resetear con _request_supabase_override.reset(token).
     """
     return _request_supabase_override.set(client)
+
+
+def set_request_db_key(key: str | None):
+    """Establece el db_key activo para el request actual (ContextVar).
+
+    Retorna el Token para poder resetear con _request_db_key.reset(token).
+    Debe llamarse junto a set_request_supabase() en cada request.
+    """
+    return _request_db_key.set(key.strip().upper() if key else None)
+
+
+def _tenant_env(name: str, default: str = "") -> str:
+    """Lee una variable ERP con soporte multi-tenant.
+
+    Orden de búsqueda:
+      1. ERP_{DB_KEY}_{name}   (override específico del tenant)
+      2. ERP_SUPABASE_{name}   (valor genérico / fallback)
+      3. default
+
+    Ejemplo con db_key='AVICOLA_PROD' y name='INVOICES_SELLER_COL':
+      Busca ERP_AVICOLA_PROD_INVOICES_SELLER_COL → ERP_SUPABASE_INVOICES_SELLER_COL → default
+    """
+    db_key = _request_db_key.get()
+    if db_key:
+        tenant_val = os.environ.get(f"ERP_{db_key}_{name}")
+        if tenant_val is not None:
+            return tenant_val
+    return os.environ.get(f"ERP_SUPABASE_{name}", default)
 
 
 def _sales_table() -> str:
@@ -1548,9 +1577,9 @@ def _profiles_name_col() -> str:
 
 
 def _invoices_seller_col() -> str:
-    c = (os.environ.get("ERP_SUPABASE_INVOICES_SELLER_COL") or "created_by").strip() or "created_by"
+    c = (_tenant_env("INVOICES_SELLER_COL") or "created_by").strip() or "created_by"
     if not _safe_sql_identifier(c):
-        raise ValueError(f"ERP_SUPABASE_INVOICES_SELLER_COL inválida: {c!r}")
+        raise ValueError(f"INVOICES_SELLER_COL inválida: {c!r}")
     return c
 
 
@@ -1559,6 +1588,21 @@ def _invoices_amount_col() -> str:
     if not _safe_sql_identifier(c):
         raise ValueError(f"ERP_SUPABASE_INVOICES_AMOUNT_COL inválida: {c!r}")
     return c
+
+
+def _invoices_valid_filter_cols() -> list[str]:
+    """Columnas extra para el filtro 'al menos una debe estar presente' (validInvoices del front).
+
+    Vacío = no aplicar el filtro extra; solo se usan excluded_types + excluded_statuses.
+    Default: sales_order_id,payment_condition
+    Override por tenant: ERP_{DB_KEY}_INVOICES_VALID_FILTER_COLS
+    Ejemplo para ERP sin payment_condition: ERP_AVICOLA_PROD_INVOICES_VALID_FILTER_COLS=
+    """
+    raw = _tenant_env("INVOICES_VALID_FILTER_COLS", "sales_order_id,payment_condition")
+    if not raw.strip():
+        return []
+    cols = [c.strip() for c in raw.split(",") if c.strip()]
+    return [c for c in cols if _safe_sql_identifier(c)]
 
 
 def _resolve_orders_list_dates(desde_raw: Any, hasta_raw: Any) -> tuple[str, str]:
@@ -2004,8 +2048,10 @@ def _list_customer_invoices_from_supabase(
     excluded_statuses = ["cancelled", "voided", "converted", "draft"]
     excluded_types = {"nota_pedido", "np"}
     # Asegurar que los campos de filtro de validInvoices estén en el select
-    extra_cols = "invoice_type,warehouse_id,sales_order_id,payment_condition"
-    full_select = select_cols if all(c in select_cols for c in ["warehouse_id", "sales_order_id"]) \
+    valid_filter_cols = _invoices_valid_filter_cols()
+    extra_parts = ["invoice_type"] + [c for c in valid_filter_cols if c not in select_cols]
+    extra_cols = ",".join(extra_parts)
+    full_select = select_cols if (not valid_filter_cols and "invoice_type" in select_cols) \
         else f"{select_cols},{extra_cols}"
     # Base query (reutilizada para count y para datos)
     def _base_q():
@@ -2038,8 +2084,8 @@ def _list_customer_invoices_from_supabase(
         rows = [
             x for x in rows
             if (x.get("invoice_type") or "").lower() not in excluded_types
-            # Al menos uno de estos campos debe estar presente
-            and (x.get("warehouse_id") or x.get("sales_order_id") or x.get("payment_condition"))
+            # Al menos uno de estos campos debe estar presente (configurable via ERP_SUPABASE_INVOICES_VALID_FILTER_COLS)
+            and (not valid_filter_cols or any(x.get(c) for c in valid_filter_cols))
         ]
     rows = _attach_customers_to_orders(rows, customer_id_c)
     hay_mas = (total_en_bd is not None and total_en_bd > len(rows)) or (total_en_bd is None and len(rows) >= lim)
@@ -2103,7 +2149,7 @@ def _get_invoice_summary_from_supabase(
     while True:
         q = (
             client.table(table)
-            .select("id,total_amount,paid_amount,remaining_amount,status,invoice_type,warehouse_id,sales_order_id,payment_condition")
+            .select("id,total_amount,paid_amount,remaining_amount,status,invoice_type" + (("," + ",".join(_invoices_valid_filter_cols())) if _invoices_valid_filter_cols() else ""))
             .gte(date_c, desde_filtro)
             .lte(date_c, hasta_filtro)
             .not_.in_("status", excluded_statuses)
@@ -2119,8 +2165,8 @@ def _get_invoice_summary_from_supabase(
                 continue
             if (x.get("invoice_type") or "").lower() in excluded_types:
                 continue
-            # Al menos uno de estos campos debe estar presente (igual que validInvoices del front)
-            if not (x.get("warehouse_id") or x.get("sales_order_id") or x.get("payment_condition")):
+            # Al menos uno de estos campos debe estar presente (configurable via ERP_SUPABASE_INVOICES_VALID_FILTER_COLS)
+            if _invoices_valid_filter_cols() and not any(x.get(c) for c in _invoices_valid_filter_cols()):
                 continue
             rows.append(x)
         if len(batch) < pg:
@@ -2211,7 +2257,7 @@ def _get_profit_margin_from_supabase(
     while True:
         q = (
             client.table(table)
-            .select("id,total_amount,invoice_type,warehouse_id,sales_order_id,payment_condition")
+            .select("id,total_amount,invoice_type" + (("," + ",".join(_invoices_valid_filter_cols())) if _invoices_valid_filter_cols() else ""))
             .gte(date_c, desde_filtro)
             .lte(date_c, hasta_filtro)
             .not_.in_("status", excluded_statuses)
@@ -2227,7 +2273,7 @@ def _get_profit_margin_from_supabase(
                 continue
             if (x.get("invoice_type") or "").lower() in excluded_types:
                 continue
-            if not (x.get("warehouse_id") or x.get("sales_order_id") or x.get("payment_condition")):
+            if _invoices_valid_filter_cols() and not any(x.get(c) for c in _invoices_valid_filter_cols()):
                 continue
             invoice_rows.append(x)
         if len(batch) < pg:
@@ -2532,7 +2578,7 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
     while True:
         r = (
             client.table(invoices_table)
-            .select("id,invoice_type,warehouse_id,sales_order_id,payment_condition")
+            .select("id,invoice_type" + (("," + ",".join(_invoices_valid_filter_cols())) if _invoices_valid_filter_cols() else ""))
             .gte(date_c, desde_filtro)
             .lte(date_c, hasta_filtro)
             .not_.in_("status", excluded_statuses)
@@ -2542,7 +2588,7 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
         rows = r.data or []
         for row in rows:
             if (row.get("invoice_type") or "").lower() not in excluded_types:
-                if row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition"):
+                if not _invoices_valid_filter_cols() or any(row.get(c) for c in _invoices_valid_filter_cols()):
                     if row.get("id"):
                         invoice_ids.append(row["id"])
         if len(rows) < page:
@@ -4279,13 +4325,16 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     excluded_statuses = ["cancelled", "voided", "converted", "draft"]
     excluded_types = {"nota_pedido", "np"}
     desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
+    invoice_seller_c = _invoices_seller_col()
+    valid_cols = _invoices_valid_filter_cols()
+    valid_extra = ("," + ",".join(valid_cols)) if valid_cols else ""
 
     start = 0
     inv_rows: list[dict[str, Any]] = []
     while True:
         r = (
             client.table(table)
-            .select(f"id,{amount_c},created_by,sales_order_id,warehouse_id,payment_condition,invoice_type")
+            .select(f"id,{amount_c},{invoice_seller_c},sales_order_id,invoice_type{valid_extra}")
             .gte(date_c, desde_filtro)
             .lte(date_c, hasta_filtro)
             .not_.in_("status", excluded_statuses)
@@ -4299,7 +4348,7 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
                 continue
             if (row.get("invoice_type") or "").lower() in excluded_types:
                 continue
-            if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
+            if valid_cols and not any(row.get(c) for c in valid_cols):
                 continue
             inv_rows.append(row)
         if len(rows) < page:
@@ -4320,11 +4369,12 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
                     so_seller[srow["id"]] = srow[seller_col]
 
     # Paso 4: agregar por vendedor y construir mapa factura→vendedor
+    # Prioridad: invoice_seller_col > sales_order.seller_col > fallback "created_by"
     invoice_to_seller: dict[str, Any] = {}
     agg: dict[Any, dict[str, Any]] = {}
     for row in inv_rows:
         so_id = row.get("sales_order_id")
-        sid = (so_id and so_seller.get(so_id)) or row.get("created_by")
+        sid = row.get(invoice_seller_c) or (so_id and so_seller.get(so_id)) or row.get("created_by")
         if sid is None:
             continue
         cur = agg.setdefault(sid, {"total_facturado": 0.0, "cantidad_facturas": 0, "costo_total": 0.0})
@@ -4592,7 +4642,7 @@ def _top_customers_by_invoicing_from_supabase(desde: str, hasta: str, metric: st
     while True:
         r = (
             client.table(table)
-            .select(f"id,{amount_c},{customer_id_c},warehouse_id,sales_order_id,payment_condition,invoice_type")
+            .select(f"id,{amount_c},{customer_id_c},sales_order_id,invoice_type" + (("," + ",".join(_invoices_valid_filter_cols())) if _invoices_valid_filter_cols() else ""))
             .gte(date_c, desde_filtro)
             .lte(date_c, hasta_filtro)
             .not_.in_("status", excluded_statuses)
@@ -4606,7 +4656,7 @@ def _top_customers_by_invoicing_from_supabase(desde: str, hasta: str, metric: st
                 continue
             if (row.get("invoice_type") or "").lower() in excluded_types:
                 continue
-            if not (row.get("warehouse_id") or row.get("sales_order_id") or row.get("payment_condition")):
+            if _invoices_valid_filter_cols() and not any(row.get(c) for c in _invoices_valid_filter_cols()):
                 continue
             inv_rows.append(row)
         if len(rows) < page:

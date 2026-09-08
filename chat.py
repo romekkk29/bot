@@ -19,6 +19,7 @@ from tools import (
     dispatch_tool,
     _get_supabase_for_key,
     set_request_supabase,
+    set_request_db_key,
 )
 
 MAX_TOOL_OUTPUT_CHARS = int(os.environ.get("MAX_TOOL_OUTPUT_CHARS", "2000"))
@@ -301,6 +302,8 @@ def run_turn(client: OpenAI | Groq, model: str, messages: list[dict], tools: lis
                 name = tc.function.name
                 raw_args = tc.function.arguments or "{}"
                 output = dispatch_tool(name, raw_args)
+                print(f"  → tool: {name}({raw_args[:120]})")
+                print(f"     ← {output[:500]}")
                 messages.append(
                     {
                         "role": "tool",
@@ -317,10 +320,11 @@ def run_turn(client: OpenAI | Groq, model: str, messages: list[dict], tools: lis
 def main() -> None:
     load_dotenv()
 
-    db_key = os.environ.get("SUPABASE_DB_KEY", "ALPINA_PROD").strip().upper()
+    db_key = os.environ.get("SUPABASE_DB_KEY", "AVICOLA_PROD").strip().upper()
     sb_client = _get_supabase_for_key(db_key)
     if sb_client:
         set_request_supabase(sb_client)
+        set_request_db_key(db_key)
 
     provider = os.environ.get("LLM_PROVIDER", "groq").strip().lower()
 
