@@ -1382,9 +1382,8 @@ def _resolve_products_by_query(query: str, limit: int) -> list[dict[str, Any]]:
     print(f"[DEBUG] tabla productos: {table!r}  |  uuid_col: {uuid_c!r}  |  code: {code_c!r}  |  name: {name_c!r}", flush=True)
     if not uuid_c:
         raise ValueError("ERP_SUPABASE_PRODUCT_COL_UUID es obligatorio para consultas de stock/cardex")
-    tok = _like_token(query)
-    pat = f"%{tok}%"
-    or_clause = ",".join(f"{col}.ilike.{pat}" for col in search_cols)
+    pat = _like_pat(query)
+    or_clause = ",".join(f"{col}.ilike.\"{pat}\"" for col in search_cols)
     print(f"[DEBUG] SELECT {select_cols} FROM {table} WHERE {or_clause} LIMIT {limit}", flush=True)
     try:
         r = client.table(table).select(select_cols).or_(or_clause).limit(limit).execute()
@@ -1400,7 +1399,7 @@ def _resolve_products_by_query(query: str, limit: int) -> list[dict[str, Any]]:
             r = (
                 client.table(table)
                 .select(base_select)
-                .or_(f"{name_c}.ilike.{pat},{code_c}.ilike.{pat}")
+                .or_(f"{name_c}.ilike.\"{pat}\",{code_c}.ilike.\"{pat}\"")
                 .limit(limit)
                 .execute()
             )
@@ -1511,6 +1510,18 @@ def _like_token(q: str, max_len: int = 80) -> str:
             out.append(c)
     s = "".join(out).strip()
     return s if s else "_"
+
+
+def _like_pat(q: str, max_len: int = 80) -> str:
+    """Construye un patrón ILIKE flexible: los espacios se convierten en %
+    para tolerar espacios dobles/triples en nombres de productos en la DB.
+    Ej: 'BOCADITOS DE CALABAZA Y MUZZARELLA' → '%BOCADITOS%DE%CALABAZA%Y%MUZZARELLA%'
+    """
+    import re
+    tok = _like_token(q, max_len)
+    # Colapsar uno o más espacios en % para búsqueda flexible
+    tok_flex = re.sub(r" +", "%", tok)
+    return f"%{tok_flex}%"
 
 
 def _orders_list_table() -> str:
@@ -2825,12 +2836,11 @@ def _customer_balance_from_supabase(customer: str) -> dict[str, Any]:
         customer_name: str | None = None
     else:
         table, id_c, name_c, tax_c, *_ = _customer_column_config()
-        tok = _like_token(customer)
-        pat = f"%{tok}%"
+        pat = _like_pat(customer)
         r = (
             client.table(table)
             .select(f"{id_c},{name_c},{tax_c}")
-            .or_(f"{name_c}.ilike.{pat},{tax_c}.ilike.{pat}")
+            .or_(f"{name_c}.ilike.\"{pat}\",{tax_c}.ilike.\"{pat}\"")
             .limit(1)
             .execute()
         )
@@ -3728,11 +3738,10 @@ def _suppliers_from_supabase(query: str, limit: int) -> dict[str, Any]:
     select_cols = _supplier_select_columns(
         id_c, name_c, tax_c, email_c, phone_c, active_c, contact_c, extra_cols
     )
-    tok = _like_token(query)
-    pat = f"%{tok}%"
-    parts = [f"{name_c}.ilike.{pat}", f"{tax_c}.ilike.{pat}"]
+    pat = _like_pat(query)
+    parts = [f"{name_c}.ilike.\"{pat}\"", f"{tax_c}.ilike.\"{pat}\""]
     if contact_c:
-        parts.append(f"{contact_c}.ilike.{pat}")
+        parts.append(f"{contact_c}.ilike.\"{pat}\"")
     or_clause = ",".join(parts)
     q = client.table(table).select(select_cols)
     if _env_flag("ERP_SUPABASE_SUPPLIERS_ONLY_ACTIVE"):
@@ -3760,11 +3769,10 @@ def _customers_from_supabase(query: str, limit: int) -> dict[str, Any]:
     select_cols = _customer_select_columns(
         id_c, name_c, tax_c, email_c, phone_c, active_c, code_c, contact_c, extra_cols
     )
-    tok = _like_token(query)
-    pat = f"%{tok}%"
-    parts = [f"{name_c}.ilike.{pat}", f"{tax_c}.ilike.{pat}", f"{code_c}.ilike.{pat}"]
+    pat = _like_pat(query)
+    parts = [f"{name_c}.ilike.\"{pat}\"", f"{tax_c}.ilike.\"{pat}\"", f"{code_c}.ilike.\"{pat}\""]
     if contact_c:
-        parts.append(f"{contact_c}.ilike.{pat}")
+        parts.append(f"{contact_c}.ilike.\"{pat}\"")
     or_clause = ",".join(parts)
     q = client.table(table).select(select_cols)
     if _env_flag("ERP_SUPABASE_CUSTOMERS_ONLY_ACTIVE"):
@@ -3790,9 +3798,8 @@ def _products_from_supabase(query: str, limit: int) -> dict[str, Any]:
     table = _products_table()
     code_c, name_c, price_c, uuid_c = _product_table_columns()
     select_cols = _product_select_list(code_c, name_c, price_c, uuid_c)
-    tok = _like_token(query)
-    pat = f"%{tok}%"
-    or_clause = f"{name_c}.ilike.{pat},{code_c}.ilike.{pat}"
+    pat = _like_pat(query)
+    or_clause = f"{name_c}.ilike.\"{pat}\",{code_c}.ilike.\"{pat}\""
     print(f"[DEBUG] SELECT {select_cols} FROM {table} WHERE {or_clause} LIMIT {limit}", flush=True)
     q = client.table(table).select(select_cols)
     r = q.or_(or_clause).limit(limit).execute()
