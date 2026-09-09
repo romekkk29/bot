@@ -1436,12 +1436,18 @@ def _warehouse_stock_column_config() -> tuple[str, str, str, str, str, str, str]
         os.environ.get("ERP_SUPABASE_WAREHOUSE_STOCK_RESERVED_COL", "reserved_stock") or "reserved_stock"
     ).strip()
     min_c = (os.environ.get("ERP_SUPABASE_WAREHOUSE_STOCK_MIN_COL", "min_stock") or "min_stock").strip()
-    projected_c = (
-        os.environ.get("ERP_SUPABASE_WAREHOUSE_STOCK_PROJECTED_COL", "stock_projected") or "stock_projected"
-    ).strip()
-    for c in (table, product_c, warehouse_c, stock_c, reserved_c, min_c, projected_c):
+    # projected_c es opcional: si la env var existe pero está vacía, se deshabilita.
+    # Si no está seteada en absoluto, se usa "stock_projected" como default.
+    _proj_raw = os.environ.get("ERP_SUPABASE_WAREHOUSE_STOCK_PROJECTED_COL")
+    if _proj_raw is None:
+        projected_c: str | None = "stock_projected"
+    else:
+        projected_c = _proj_raw.strip() or None
+    for c in (table, product_c, warehouse_c, stock_c, reserved_c, min_c):
         if not _safe_sql_identifier(c):
             raise ValueError(f"identificador warehouse_stock inválido: {c!r}")
+    if projected_c and not _safe_sql_identifier(projected_c):
+        raise ValueError(f"identificador warehouse_stock inválido: {projected_c!r}")
     return table, product_c, warehouse_c, stock_c, reserved_c, min_c, projected_c
 
 
@@ -3797,14 +3803,41 @@ def _products_from_supabase(query: str, limit: int) -> dict[str, Any]:
     assert client is not None
     table = _products_table()
     code_c, name_c, price_c, uuid_c = _product_table_columns()
-    select_cols = _product_select_list(code_c, name_c, price_c, uuid_c)
+    # Columnas de costo e info adicional configurables
+    cost_c = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_PRICE") or "cost_price").strip()
+    cost_tax_c = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_COST_INCLUDES_TAX") or "cost_price_includes_tax").strip()
+    vat_c = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_VAT_RATE") or "vat_rate").strip()
+    unit_c = (os.environ.get("ERP_SUPABASE_PRODUCT_COL_SALE_UNIT") or "sale_unit").strip()
+    # SELECT base + campos extra
+    base_cols = _product_select_list(code_c, name_c, price_c, uuid_c)
+    extra_cols = [c for c in (cost_c, cost_tax_c, vat_c, unit_c) if c and _safe_sql_identifier(c)]
+    all_cols_parts = list(dict.fromkeys(base_cols.split(",") + extra_cols))
+    select_cols_full = ",".join(all_cols_parts)
     pat = _like_pat(query)
     or_clause = f"{name_c}.ilike.\"{pat}\",{code_c}.ilike.\"{pat}\""
-    print(f"[DEBUG] SELECT {select_cols} FROM {table} WHERE {or_clause} LIMIT {limit}", flush=True)
-    q = client.table(table).select(select_cols)
-    r = q.or_(or_clause).limit(limit).execute()
-    raw_rows: list[dict[str, Any]] = r.data or []
-    rows = [_normalize_product_row(row, code_c, name_c, price_c, uuid_c) for row in raw_rows]
+    print(f"[DEBUG] SELECT {select_cols_full} FROM {table} WHERE {or_clause} LIMIT {limit}", flush=True)
+    q = client.table(table).select(select_cols_full)
+    try:
+        r = q.or_(or_clause).limit(limit).execute()
+        raw_rows: list[dict[str, Any]] = r.data or []
+    except Exception:
+        # Fallback sin columnas extra si alguna no existe
+        q2 = client.table(table).select(base_cols)
+        r = q2.or_(or_clause).limit(limit).execute()
+        raw_rows = r.data or []
+        cost_c = cost_tax_c = vat_c = unit_c = ""
+    rows: list[dict[str, Any]] = []
+    for row in raw_rows:
+        item = _normalize_product_row(row, code_c, name_c, price_c, uuid_c)
+        if cost_c and cost_c in row:
+            item["costo"] = _to_float(row.get(cost_c))
+        if cost_tax_c and cost_tax_c in row:
+            item["costo_incluye_iva"] = bool(row.get(cost_tax_c))
+        if vat_c and vat_c in row and row.get(vat_c) is not None:
+            item["iva_pct"] = _to_float(row.get(vat_c))
+        if unit_c and unit_c in row and row.get(unit_c):
+            item["unidad_venta"] = row[unit_c]
+        rows.append(item)
     return {
         "query": query,
         "resultados": rows,
@@ -3861,7 +3894,10 @@ def _product_available_stock_from_supabase(query: str, limit: int) -> dict[str, 
     ws_table, ws_product_c, ws_warehouse_c, ws_stock_c, ws_reserved_c, ws_min_c, ws_projected_c = (
         _warehouse_stock_column_config()
     )
-    select_cols = ",".join((ws_product_c, ws_warehouse_c, ws_stock_c, ws_reserved_c, ws_min_c, ws_projected_c))
+    _ws_cols = [ws_product_c, ws_warehouse_c, ws_stock_c, ws_reserved_c, ws_min_c]
+    if ws_projected_c:
+        _ws_cols.append(ws_projected_c)
+    select_cols = ",".join(_ws_cols)
     r = client.table(ws_table).select(select_cols).in_(ws_product_c, product_ids).execute()
     stock_rows: list[dict[str, Any]] = r.data or []
 
@@ -3885,7 +3921,7 @@ def _product_available_stock_from_supabase(query: str, limit: int) -> dict[str, 
             stock_v = _to_float(row.get(ws_stock_c))
             reserved_v = _to_float(row.get(ws_reserved_c))
             min_v = _to_float(row.get(ws_min_c))
-            projected_v = _to_float(row.get(ws_projected_c))
+            projected_v = _to_float(row.get(ws_projected_c)) if ws_projected_c else 0.0
             stock_total += stock_v
             reserved_total += reserved_v
             min_total += min_v
