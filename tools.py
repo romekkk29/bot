@@ -1,4 +1,4 @@
-"""Definición de tools (schema OpenAI/Groq) y handlers.
+﻿"""Definición de tools (schema OpenAI/Groq) y handlers.
 
 - Sin SUPABASE_*: stubs locales.
 - Con Supabase: tablas/columnas vía variables ``ERP_SUPABASE_*`` (un deploy = un proyecto DB).
@@ -1030,14 +1030,14 @@ def _tenant_env(name: str, default: str = "") -> str:
 
 
 def _sales_table() -> str:
-    return os.environ.get("ERP_SUPABASE_SALES_TABLE", "erp_sales").strip() or "erp_sales"
+    return _tenant_env("SALES_TABLE", "erp_sales").strip() or "erp_sales"
 
 
 def _sales_orders_column_config() -> tuple[str, str, str]:
     """(tabla, col_fecha, col_importe)."""
     table = _sales_table()
-    date_c = (os.environ.get("ERP_SUPABASE_SALES_DATE_COL", "fecha") or "fecha").strip()
-    amount_c = (os.environ.get("ERP_SUPABASE_SALES_AMOUNT_COL", "monto") or "monto").strip()
+    date_c = (_tenant_env("SALES_DATE_COL", "fecha") or "fecha").strip()
+    amount_c = (_tenant_env("SALES_AMOUNT_COL", "monto") or "monto").strip()
     if not _safe_sql_identifier(table):
         raise ValueError(f"ERP_SUPABASE_SALES_TABLE inválido: {table!r}")
     for c in (date_c, amount_c):
@@ -1047,7 +1047,7 @@ def _sales_orders_column_config() -> tuple[str, str, str]:
 
 
 def _sales_source_mode() -> str:
-    v = os.environ.get("ERP_SUPABASE_SALES_SOURCE", "orders").strip().lower()
+    v = _tenant_env("SALES_SOURCE", "orders").strip().lower()
     if v in ("items", "lines", "order_lines", "sales_order_items"):
         return "items"
     return "orders"
@@ -1055,16 +1055,12 @@ def _sales_source_mode() -> str:
 
 def _sales_items_column_config() -> tuple[str, str, str, str, str, str]:
     """(items_table, amount_col, fk_col, orders_table, order_date_col, order_id_col)."""
-    items_t = (
-        os.environ.get("ERP_SUPABASE_SALES_ITEMS_TABLE", "sales_order_items") or "sales_order_items"
-    ).strip()
-    amount_c = (
-        os.environ.get("ERP_SUPABASE_SALES_ITEMS_AMOUNT_COL", "line_total") or "line_total"
-    ).strip()
-    fk_c = (os.environ.get("ERP_SUPABASE_SALES_ITEMS_FK_COL", "sales_order_id") or "sales_order_id").strip()
-    orders_t = (os.environ.get("ERP_SUPABASE_SALES_ORDERS_TABLE", "sales_orders") or "sales_orders").strip()
-    date_c = (os.environ.get("ERP_SUPABASE_SALES_ORDER_DATE_COL", "order_date") or "order_date").strip()
-    oid_c = (os.environ.get("ERP_SUPABASE_SALES_ORDER_ID_COL", "id") or "id").strip()
+    items_t = (_tenant_env("SALES_ITEMS_TABLE", "sales_order_items") or "sales_order_items").strip()
+    amount_c = (_tenant_env("SALES_ITEMS_AMOUNT_COL", "line_total") or "line_total").strip()
+    fk_c = (_tenant_env("SALES_ITEMS_FK_COL", "sales_order_id") or "sales_order_id").strip()
+    orders_t = (_tenant_env("SALES_ORDERS_TABLE", "sales_orders") or "sales_orders").strip()
+    date_c = (_tenant_env("SALES_ORDER_DATE_COL", "order_date") or "order_date").strip()
+    oid_c = (_tenant_env("SALES_ORDER_ID_COL", "id") or "id").strip()
     for name in (items_t, amount_c, fk_c, orders_t, date_c, oid_c):
         if not _safe_sql_identifier(name):
             raise ValueError(f"identificador ventas (modo items) inválido: {name!r}")
@@ -1072,8 +1068,8 @@ def _sales_items_column_config() -> tuple[str, str, str, str, str, str]:
 
 
 def _sales_items_top_columns() -> tuple[str, str]:
-    product_c = (os.environ.get("ERP_SUPABASE_SALES_ITEMS_PRODUCT_ID_COL", "product_id") or "product_id").strip()
-    qty_c = (os.environ.get("ERP_SUPABASE_SALES_ITEMS_QTY_COL", "quantity") or "quantity").strip()
+    product_c = (_tenant_env("SALES_ITEMS_PRODUCT_ID_COL", "product_id") or "product_id").strip()
+    qty_c = (_tenant_env("SALES_ITEMS_QTY_COL", "quantity") or "quantity").strip()
     for c in (product_c, qty_c):
         if not _safe_sql_identifier(c):
             raise ValueError(f"columna de ítems de venta inválida para top productos: {c!r}")
@@ -1094,6 +1090,14 @@ def _customers_table() -> str:
 
 def _env_flag(name: str, default: bool = False) -> bool:
     v = os.environ.get(name, "").strip().lower()
+    if not v:
+        return default
+    return v in ("1", "true", "yes", "on")
+
+
+def _tenant_flag(name: str, default: bool = False) -> bool:
+    """Como _env_flag pero usa _tenant_env para soporte multi-tenant."""
+    v = _tenant_env(name, "").strip().lower()
     if not v:
         return default
     return v in ("1", "true", "yes", "on")
@@ -1510,20 +1514,16 @@ def _like_token(q: str, max_len: int = 80) -> str:
 
 
 def _orders_list_table() -> str:
-    for key in (
-        "ERP_SUPABASE_ORDERS_LIST_TABLE",
-        "ERP_SUPABASE_SALES_ORDERS_TABLE",
-        "ERP_SUPABASE_SALES_TABLE",
-    ):
-        t = (os.environ.get(key) or "").strip()
+    for name in ("ORDERS_LIST_TABLE", "SALES_ORDERS_TABLE", "SALES_TABLE"):
+        t = (_tenant_env(name) or "").strip()
         if t and _safe_sql_identifier(t):
             return t
     return "sales_orders"
 
 
 def _orders_list_date_column() -> str:
-    for key in ("ERP_SUPABASE_ORDERS_LIST_DATE_COL", "ERP_SUPABASE_SALES_ORDER_DATE_COL"):
-        c = (os.environ.get(key) or "").strip()
+    for name in ("ORDERS_LIST_DATE_COL", "SALES_ORDER_DATE_COL"):
+        c = (_tenant_env(name) or "").strip()
         if c and _safe_sql_identifier(c):
             return c
     return "order_date"
@@ -1531,7 +1531,7 @@ def _orders_list_date_column() -> str:
 
 def _orders_list_select_expr() -> str:
     default = "id,order_number,order_date,total_amount,status,currency"
-    s = (os.environ.get("ERP_SUPABASE_ORDERS_LIST_SELECT") or default).strip() or default
+    s = (_tenant_env("ORDERS_LIST_SELECT") or default).strip() or default
     parts = [p.strip() for p in s.split(",") if p.strip()]
     for p in parts:
         if not _safe_sql_identifier(p):
@@ -1540,25 +1540,25 @@ def _orders_list_select_expr() -> str:
 
 
 def _orders_list_status_column() -> str:
-    c = (os.environ.get("ERP_SUPABASE_ORDERS_STATUS_COL") or "status").strip() or "status"
+    c = (_tenant_env("ORDERS_STATUS_COL") or "status").strip() or "status"
     if not _safe_sql_identifier(c):
         raise ValueError(f"ERP_SUPABASE_ORDERS_STATUS_COL inválida: {c!r}")
     return c
 
 
 def _orders_customer_id_column() -> str:
-    c = (os.environ.get("ERP_SUPABASE_ORDERS_CUSTOMER_ID_COL") or "customer_id").strip() or "customer_id"
+    c = (_tenant_env("ORDERS_CUSTOMER_ID_COL") or "customer_id").strip() or "customer_id"
     if not _safe_sql_identifier(c):
         raise ValueError(f"ERP_SUPABASE_ORDERS_CUSTOMER_ID_COL inválida: {c!r}")
     return c
 
 
 def _orders_include_customer_data() -> bool:
-    return _env_flag("ERP_SUPABASE_ORDERS_INCLUDE_CUSTOMER", True)
+    return _tenant_flag("ORDERS_INCLUDE_CUSTOMER", True)
 
 
 def _orders_seller_col() -> str:
-    c = (os.environ.get("ERP_SUPABASE_ORDERS_SELLER_COL") or "created_by").strip() or "created_by"
+    c = (_tenant_env("ORDERS_SELLER_COL") or "created_by").strip() or "created_by"
     if not _safe_sql_identifier(c):
         raise ValueError(f"ERP_SUPABASE_ORDERS_SELLER_COL inválida: {c!r}")
     return c
@@ -1607,7 +1607,7 @@ def _invoices_valid_filter_cols() -> list[str]:
 
 def _resolve_orders_list_dates(desde_raw: Any, hasta_raw: Any) -> tuple[str, str]:
     try:
-        days = int(os.environ.get("ERP_SUPABASE_ORDERS_LIST_DEFAULT_DAYS", "90") or "90")
+        days = int(_tenant_env("ORDERS_LIST_DEFAULT_DAYS", "90") or "90")
     except ValueError:
         days = 90
     days = max(1, min(days, 3660))
@@ -1763,7 +1763,7 @@ _UUID_RE = re.compile(
 
 def _sales_order_items_select_expr() -> str:
     default = "id,sales_order_id,product_id,quantity,unit_price,line_total,product_name,sku"
-    s = (os.environ.get("ERP_SUPABASE_SALES_ORDER_ITEMS_SELECT") or default).strip() or default
+    s = (_tenant_env("SALES_ORDER_ITEMS_SELECT") or default).strip() or default
     parts = [p.strip() for p in s.split(",") if p.strip()]
     for p in parts:
         if not _safe_sql_identifier(p):
@@ -1772,7 +1772,7 @@ def _sales_order_items_select_expr() -> str:
 
 
 def _sales_order_number_column() -> str:
-    c = (os.environ.get("ERP_SUPABASE_ORDERS_NUMBER_COL") or "order_number").strip() or "order_number"
+    c = (_tenant_env("ORDERS_NUMBER_COL") or "order_number").strip() or "order_number"
     if not _safe_sql_identifier(c):
         raise ValueError(f"ERP_SUPABASE_ORDERS_NUMBER_COL inválida: {c!r}")
     return c
@@ -1831,7 +1831,6 @@ def _list_sales_order_items_from_supabase(sales_order_id: str, limit: int) -> di
         "cantidad_devuelta": len(rows),
         "limite": lim,
         "fuente": "supabase",
-        "tabla": items_t,
     }
 
 
@@ -2096,7 +2095,6 @@ def _list_customer_invoices_from_supabase(
         "limite_aplicado": lim,
         "hay_mas": hay_mas,
         "fuente": "supabase",
-        "tabla": table,
     }
     if total_en_bd is not None:
         result["total_en_bd"] = total_en_bd
@@ -2190,7 +2188,6 @@ def _get_invoice_summary_from_supabase(
         "cantidad_facturas": len(rows),
         "por_estado": por_estado,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -2455,7 +2452,6 @@ def _list_customer_invoice_items_from_supabase(invoice_id: str, limit: int) -> d
         "cantidad_devuelta": len(rows),
         "limite": lim,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -2738,7 +2734,6 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
         "productos": result_list,
         "cantidad_productos_encontrados": len(result_list),
         "fuente": "supabase",
-        "tabla_items": items_table,
         "nota_costo": "Costo de mercadería c/ IVA (desde purchase_cost del ítem o cost_price del producto). Markup = Utilidad / Costo × 100.",
     }
 
@@ -2782,7 +2777,6 @@ def _list_customer_payments_from_supabase(
         "cantidad_devuelta": len(rows),
         "limite": lim,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -2917,9 +2911,9 @@ def _list_sales_orders_from_supabase(
     rows: list[dict[str, Any]] = r.data or []
     if _orders_include_customer_data():
         rows = _attach_customers_to_orders(rows, customer_id_col)
-    amount_col = (os.environ.get("ERP_SUPABASE_ORDERS_LIST_SELECT") or "total_amount")
+    amount_col = (_tenant_env("ORDERS_LIST_SELECT") or "total_amount")
     # Determinar columna de importe del listado
-    amount_cols = [p.strip() for p in (os.environ.get("ERP_SUPABASE_ORDERS_LIST_SELECT") or "total_amount").split(",") if p.strip()]
+    amount_cols = [p.strip() for p in (_tenant_env("ORDERS_LIST_SELECT") or "total_amount").split(",") if p.strip()]
     _amount_c = next((c for c in amount_cols if "amount" in c.lower() or "total" in c.lower()), None)
     total_monto_devuelto = None
     if _amount_c:
@@ -2935,7 +2929,6 @@ def _list_sales_orders_from_supabase(
         "limite": lim,
         "hay_mas": hay_mas,
         "fuente": "supabase",
-        "tabla": table,
     }
     if total_en_bd is not None:
         result["total_en_bd"] = total_en_bd
@@ -2994,7 +2987,6 @@ def _count_sales_orders_by_status_from_supabase(desde: str, hasta: str) -> dict[
         "conteo_por_estado": ordered,
         "total_ordenes": total,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -3071,11 +3063,10 @@ def _top_selling_products_from_supabase(desde: str, hasta: str, limit: int) -> d
             "cantidad_devuelta": 0,
             "limite": limit,
             "fuente": "supabase",
-            "tabla_items": items_t,
         }
 
     try:
-        chunk_sz = int(os.environ.get("ERP_SUPABASE_SALES_ITEMS_ORDER_ID_CHUNK", "80") or "80")
+        chunk_sz = int(_tenant_env("SALES_ITEMS_ORDER_ID_CHUNK", "80") or "80")
     except ValueError:
         chunk_sz = 80
     chunk_sz = max(1, min(chunk_sz, 200))
@@ -3173,7 +3164,6 @@ def _top_selling_products_from_supabase(desde: str, hasta: str, limit: int) -> d
         "cantidad_devuelta": len(out),
         "limite": limit,
         "fuente": "supabase",
-        "tabla_items": items_t,
         "nota_costo": (
             "Costo estimado basado en el cost_price actual del producto (c/ IVA). "
             "Para un ranking por ganancia exacta, usar el Reporte de Rentabilidad del ERP."
@@ -3245,11 +3235,10 @@ def _least_selling_products_from_supabase(desde: str, hasta: str, limit: int) ->
             "cantidad_devuelta": 0,
             "limite": limit,
             "fuente": "supabase",
-            "tabla_items": items_t,
         }
 
     try:
-        chunk_sz = int(os.environ.get("ERP_SUPABASE_SALES_ITEMS_ORDER_ID_CHUNK", "80") or "80")
+        chunk_sz = int(_tenant_env("SALES_ITEMS_ORDER_ID_CHUNK", "80") or "80")
     except ValueError:
         chunk_sz = 80
     chunk_sz = max(1, min(chunk_sz, 200))
@@ -3313,7 +3302,6 @@ def _least_selling_products_from_supabase(desde: str, hasta: str, limit: int) ->
         "cantidad_devuelta": len(out),
         "limite": limit,
         "fuente": "supabase",
-        "tabla_items": items_t,
     }
 
 
@@ -3347,7 +3335,6 @@ def _purchase_summary_from_supabase(desde: str, hasta: str) -> dict[str, Any]:
         "total_compras": total,
         "cantidad_ordenes": len(rows),
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -3404,7 +3391,6 @@ def _list_purchase_orders_from_supabase(desde: str, hasta: str, limit: int) -> d
         "cantidad_devuelta": len(rows),
         "limite": lim,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -3456,7 +3442,6 @@ def _count_purchase_orders_by_status_from_supabase(desde: str, hasta: str) -> di
         "conteo_por_estado": ordered,
         "total_ordenes": total,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -3504,7 +3489,6 @@ def _list_purchase_order_items_from_supabase(purchase_order_id: str, limit: int)
         "cantidad_devuelta": len(rows),
         "limite": lim,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -3666,7 +3650,6 @@ def _sales_from_supabase_orders(client: Any, desde: str, hasta: str) -> dict[str
         "cantidad_documentos": len(rows),
         "fuente": "supabase",
         "modo": "orders",
-        "tabla": table,
     }
 
 
@@ -3695,7 +3678,7 @@ def _sales_from_supabase_items(client: Any, desde: str, hasta: str) -> dict[str,
     total = 0.0
     line_count = 0
     try:
-        chunk_sz = int(os.environ.get("ERP_SUPABASE_SALES_ITEMS_ORDER_ID_CHUNK", "80") or "80")
+        chunk_sz = int(_tenant_env("SALES_ITEMS_ORDER_ID_CHUNK", "80") or "80")
     except ValueError:
         chunk_sz = 80
     chunk_sz = max(1, min(chunk_sz, 200))
@@ -3726,8 +3709,6 @@ def _sales_from_supabase_items(client: Any, desde: str, hasta: str) -> dict[str,
         "cantidad_lineas": line_count,
         "fuente": "supabase",
         "modo": "items",
-        "tabla": items_t,
-        "tabla_pedidos": orders_t,
     }
 
 
@@ -3768,7 +3749,6 @@ def _suppliers_from_supabase(query: str, limit: int) -> dict[str, Any]:
         "query": query,
         "resultados": rows,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -3801,7 +3781,6 @@ def _customers_from_supabase(query: str, limit: int) -> dict[str, Any]:
         "query": query,
         "resultados": rows,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -4504,7 +4483,6 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
         "cantidad_devuelta": len(out),
         "limite": limit,
         "fuente": "supabase",
-        "tabla": table,
         "nota_costo": "Costo de mercadería c/ IVA (purchase_cost del ítem o cost_price del producto). Markup = Utilidad / Costo × 100.",
     }
 
@@ -4707,7 +4685,6 @@ def _top_customers_by_invoicing_from_supabase(desde: str, hasta: str, metric: st
         "cantidad_devuelta": len(out),
         "limite": limit,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
@@ -4734,7 +4711,7 @@ def _top_sellers_from_supabase(desde: str, hasta: str, metric: str, limit: int) 
     table = _orders_list_table()
     date_c = _orders_list_date_column()
     seller_c = _orders_seller_col()
-    amount_c = (os.environ.get("ERP_SUPABASE_SALES_AMOUNT_COL") or "total_amount").strip() or "total_amount"
+    amount_c = (_tenant_env("SALES_AMOUNT_COL") or "total_amount").strip() or "total_amount"
 
     page = 1000
     start = 0
@@ -4793,7 +4770,6 @@ def _top_sellers_from_supabase(desde: str, hasta: str, metric: str, limit: int) 
         "cantidad_devuelta": len(out),
         "limite": limit,
         "fuente": "supabase",
-        "tabla": table,
     }
 
 
