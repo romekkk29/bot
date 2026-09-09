@@ -824,13 +824,15 @@ TOOLS: list[dict[str, Any]] = [
         "function": {
             "name": "get_top_sellers_by_invoicing",
             "description": (
-                "Ranking de VENDEDORES (no clientes) basado en FACTURACIÓN REAL (customer_invoices: FA, FB, remito). "
+                "Ranking de VENDEDORES o CAJEROS basado en FACTURACIÓN REAL (customer_invoices: FA, FB, remito). "
                 "Solo incluye comprobantes ya emitidos. "
-                "Devuelve por vendedor: total_facturado, costo_mercaderia (c/ IVA), utilidad, markup_pct y pct_utilidad_ventas. "
+                "Devuelve por vendedor/cajero: total_facturado, costo_mercaderia (c/ IVA), utilidad, markup_pct y pct_utilidad_ventas. "
                 "Usar cuando pregunten: 'quién más facturó', 'vendedor con mayor facturación', "
-                "'qué vendedor genera más rentabilidad', 'qué vendedor deja más ganancia', "
-                "'ranking de vendedores por ganancia', 'facturación real por vendedor'. "
-                "Si el usuario nombra un vendedor específico, usar limit alto (hasta 50) para poder ubicarlo en el ranking. "
+                "'ranking de vendedores por ganancia', 'facturación real por vendedor', "
+                "'ranking de cajeros', 'cajero que más vendió', 'ventas por cajero'. "
+                "Cuando el usuario diga 'cajero' o 'cajeros', usar group_by='cajero'. "
+                "Cuando el usuario diga 'vendedor' o 'vendedores', usar group_by='vendedor' (default). "
+                "Si el usuario nombra un vendedor/cajero específico, usar limit alto (hasta 50) para poder ubicarlo en el ranking. "
                 "NO usar para órdenes de venta pendientes: para eso usar get_top_sellers. "
                 "NO usar si el usuario pregunta por CLIENTES: para eso usar get_top_customers_by_invoicing."
             ),
@@ -851,7 +853,11 @@ TOOLS: list[dict[str, Any]] = [
                     },
                     "limit": {
                         "anyOf": [{"type": "integer"}, {"type": "string"}],
-                        "description": "Máximo de vendedores a devolver (default 10, máx 50)",
+                        "description": "Máximo de vendedores/cajeros a devolver (default 10, máx 50)",
+                    },
+                    "group_by": {
+                        "type": "string",
+                        "description": "Agrupar por 'vendedor' (default) o 'cajero'. Usar 'cajero' cuando el usuario mencione cajeros/cajero.",
                     },
                 },
                 "required": [],
@@ -1600,6 +1606,14 @@ def _invoices_seller_col() -> str:
     return c
 
 
+def _invoices_cashier_col() -> str:
+    """Columna del cajero en facturas. Vacío si no está configurada para este tenant."""
+    c = (_tenant_env("INVOICES_CASHIER_COL") or "").strip()
+    if c and not _safe_sql_identifier(c):
+        raise ValueError(f"INVOICES_CASHIER_COL inválida: {c!r}")
+    return c
+
+
 def _invoices_amount_col() -> str:
     c = (os.environ.get("ERP_SUPABASE_INVOICES_AMOUNT_COL") or "total_amount").strip() or "total_amount"
     if not _safe_sql_identifier(c):
@@ -2317,9 +2331,9 @@ def _get_profit_margin_from_supabase(
     product_id_c = _invoice_items_product_id_col()
     qty_c = _invoice_items_qty_col()
 
-    purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
-    purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
-    purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
+    purchase_cost_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
+    purchase_cost_tax_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
+    purchase_vat_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
 
     for c in (purchase_cost_c, purchase_cost_tax_c, purchase_vat_c):
         if not _safe_sql_identifier(c):
@@ -2638,9 +2652,9 @@ def _get_product_sales_units_from_supabase(query: str, desde: str, hasta: str) -
     qty_c = _invoice_items_qty_col()
     amount_c = _invoice_items_amount_col()
 
-    purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
-    purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
-    purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
+    purchase_cost_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
+    purchase_cost_tax_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
+    purchase_vat_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
     # tax_amount: IVA por línea — igual que el ERP: Venta Final = line_total + tax_amount
     tax_amount_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_TAX_AMOUNT_COL") or "tax_amount").strip()
 
@@ -4300,7 +4314,7 @@ def _stub_top_sellers_by_invoicing(desde: str, hasta: str, metric: str, limit: i
     }
 
 
-def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str, limit: int) -> dict[str, Any]:
+def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str, limit: int, group_by: str = "vendedor") -> dict[str, Any]:
     client = _get_supabase()
     assert client is not None
     table = _invoices_table()
@@ -4309,13 +4323,20 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     orders_table = _orders_list_table()
     seller_col = _orders_seller_col()
 
+    # Cuando se agrupa por cajero, usar la columna de cajero (ya contiene el nombre directamente)
+    use_cashier = (group_by == "cajero")
+    if use_cashier:
+        cashier_c = _invoices_cashier_col()
+        if not cashier_c:
+            return {"error": "Este tenant no tiene configurada la columna de cajero (INVOICES_CASHIER_COL)."}
+
     items_t = _invoice_items_table()
     fk_c = _invoice_items_fk_col()
     product_id_c = _invoice_items_product_id_col()
     qty_c = _invoice_items_qty_col()
-    purchase_cost_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
-    purchase_cost_tax_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
-    purchase_vat_c = (os.environ.get("ERP_SUPABASE_INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
+    purchase_cost_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_COST_COL") or "purchase_cost").strip()
+    purchase_cost_tax_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_COST_INCLUDES_TAX_COL") or "purchase_cost_includes_tax").strip()
+    purchase_vat_c = (_tenant_env("INVOICE_ITEMS_PURCHASE_VAT_RATE_COL") or "purchase_vat_rate").strip()
 
     # Paso 1: IDs que son destino de conversión
     page = 1000
@@ -4347,16 +4368,22 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
     excluded_statuses = ["cancelled", "voided", "converted", "draft"]
     excluded_types = {"nota_pedido", "np"}
     desde_filtro, hasta_filtro = _date_range_bounds(desde, hasta)
-    invoice_seller_c = _invoices_seller_col()
+    # Columna de agrupación: cajero (nombre directo) o vendedor (UUID → profiles)
+    if use_cashier:
+        group_col = cashier_c  # type: ignore[possibly-undefined]
+    else:
+        group_col = _invoices_seller_col()
     valid_cols = _invoices_valid_filter_cols()
     valid_extra = ("," + ",".join(valid_cols)) if valid_cols else ""
+    # Para cajero no necesitamos sales_order_id (la columna ya es el nombre)
+    so_select = "" if use_cashier else ",sales_order_id"
 
     start = 0
     inv_rows: list[dict[str, Any]] = []
     while True:
         r = (
             client.table(table)
-            .select(f"id,{amount_c},{invoice_seller_c},sales_order_id,invoice_type{valid_extra}")
+            .select(f"id,{amount_c},{group_col}{so_select},invoice_type{valid_extra}")
             .gte(date_c, desde_filtro)
             .lte(date_c, hasta_filtro)
             .not_.in_("status", excluded_statuses)
@@ -4380,23 +4407,29 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
             break
 
     # Paso 3: resolver so.created_by para facturas con sales_order_id (COALESCE)
+    # Solo aplica para vendedores (UUIDs); cajeros ya tienen el nombre en la columna.
     so_seller: dict[str, str] = {}
-    so_ids = list({row["sales_order_id"] for row in inv_rows if row.get("sales_order_id")})
-    if so_ids:
-        for i in range(0, len(so_ids), 200):
-            chunk = so_ids[i : i + 200]
-            r = client.table(orders_table).select(f"id,{seller_col}").in_("id", chunk).execute()
-            for srow in r.data or []:
-                if srow.get(seller_col):
-                    so_seller[srow["id"]] = srow[seller_col]
+    if not use_cashier:
+        so_ids = list({row["sales_order_id"] for row in inv_rows if row.get("sales_order_id")})
+        if so_ids:
+            for i in range(0, len(so_ids), 200):
+                chunk = so_ids[i : i + 200]
+                r = client.table(orders_table).select(f"id,{seller_col}").in_("id", chunk).execute()
+                for srow in r.data or []:
+                    if srow.get(seller_col):
+                        so_seller[srow["id"]] = srow[seller_col]
 
-    # Paso 4: agregar por vendedor y construir mapa factura→vendedor
-    # Prioridad: invoice_seller_col > sales_order.seller_col > fallback "created_by"
+    # Paso 4: agregar por vendedor/cajero y construir mapa factura→id
+    # Vendedor: prioridad invoice_seller_col > sales_order.seller_col > "created_by"
+    # Cajero: usa directamente la columna configurada (ya es el nombre)
     invoice_to_seller: dict[str, Any] = {}
     agg: dict[Any, dict[str, Any]] = {}
     for row in inv_rows:
-        so_id = row.get("sales_order_id")
-        sid = row.get(invoice_seller_c) or (so_id and so_seller.get(so_id)) or row.get("created_by")
+        if use_cashier:
+            sid = row.get(group_col)
+        else:
+            so_id = row.get("sales_order_id")
+            sid = row.get(group_col) or (so_id and so_seller.get(so_id)) or row.get("created_by")
         if sid is None:
             continue
         cur = agg.setdefault(sid, {"total_facturado": 0.0, "cantidad_facturas": 0, "costo_total": 0.0})
@@ -4486,12 +4519,12 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
             tax_mult = 1.0 if includes_tax else (1.0 + vat_rate / 100.0)
             agg[seller_id]["costo_total"] += qty * base_cost * tax_mult
 
-    # Paso 5: resolver nombres desde profiles
+    # Paso 5: resolver nombres desde profiles (para vendedores y cajeros con UUID)
     profiles_t = _profiles_table()
     pid_c = _profiles_id_col()
     pname_c = _profiles_name_col()
-    seller_ids = list(agg.keys())
     names: dict[Any, str] = {}
+    seller_ids = list(agg.keys())
     if seller_ids:
         for i in range(0, len(seller_ids), 200):
             chunk = seller_ids[i : i + 200]
@@ -4501,6 +4534,7 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
 
     sort_key = "total_facturado" if metric != "cantidad" else "cantidad_facturas"
     ranked = sorted(agg.items(), key=lambda kv: -kv[1][sort_key])
+    id_key = "cajero" if use_cashier else "user_id"
     out: list[dict[str, Any]] = []
     for sid, vals in ranked[:limit]:
         facturado = vals["total_facturado"]
@@ -4508,8 +4542,8 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
         utilidad = round(facturado - costo, 2)
         markup_pct = round((utilidad / costo) * 100, 2) if costo > 0 else 0.0
         pct_utilidad = round((utilidad / facturado) * 100, 2) if facturado > 0 else 0.0
-        out.append({
-            "user_id": sid,
+        entry: dict[str, Any] = {
+            id_key: sid,
             "nombre": names.get(sid) or str(sid),
             "total_facturado": round(facturado, 2),
             "costo_mercaderia": costo,
@@ -4517,12 +4551,14 @@ def _top_sellers_by_invoicing_from_supabase(desde: str, hasta: str, metric: str,
             "markup_pct": markup_pct,
             "pct_utilidad_ventas": pct_utilidad,
             "cantidad_facturas": vals["cantidad_facturas"],
-        })
+        }
+        out.append(entry)
 
+    top_key = "top_cajeros" if use_cashier else "top_vendedores"
     return {
         "periodo": {"desde": desde, "hasta": hasta},
         "metrica": metric,
-        "top_vendedores": out,
+        top_key: out,
         "cantidad_devuelta": len(out),
         "limite": limit,
         "fuente": "supabase",
@@ -5195,8 +5231,11 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                         "Usá un rango más corto, por ejemplo el mes actual o un mes específico."
                     )
                 }, ensure_ascii=False)
+            group_by = str(args.get("group_by") or "vendedor").strip().lower()
+            if group_by not in ("vendedor", "cajero"):
+                group_by = "vendedor"
             if use_sb:
-                result = _top_sellers_by_invoicing_from_supabase(desde, hasta, metric, lim)
+                result = _top_sellers_by_invoicing_from_supabase(desde, hasta, metric, lim, group_by)
             else:
                 result = _stub_top_sellers_by_invoicing(desde, hasta, metric, lim)
         elif name == "get_top_customers_by_invoicing":
