@@ -421,8 +421,9 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Busca productos por texto (SKU/código, nombre, etc.). "
                 "Requiere un texto de búsqueda concreto; NO llamar si el usuario pide 'todos los productos' sin búsqueda. "
-                "Devuelve resultados con sku_o_codigo, nombre, precio (y id UUID si aplica). "
-                "Usar cuando pregunten por productos, nombre por SKU, listados filtrados."
+                "Devuelve: sku_o_codigo, nombre, precio, costo, IVA, unidad de venta. "
+                "Si ERP_PRODUCT_INCLUDE_STOCK está habilitado, también devuelve stock_total y stock_disponible. "
+                "Usar cuando pregunten por precio, costo, stock, unidad, IVA, datos generales de un producto."
             ),
             "parameters": {
                 "type": "object",
@@ -682,6 +683,31 @@ TOOLS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["desde", "hasta"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_purchase_invoice",
+            "description": (
+                "Busca una o varias facturas de COMPRA (payable_invoices / proveedor) por número de comprobante. "
+                "Devuelve: número, tipo (factura_a/b/c, remito, etc.), fecha de emisión, fecha de vencimiento, "
+                "total, pagado, saldo pendiente, estado y proveedor. "
+                "Usar cuando el usuario mencione un número de factura de proveedor, o cuando no se sepa "
+                "si es de venta o compra (llamar en paralelo con list_customer_invoice_items). "
+                "Triggers: 'la factura 0002-00000017', 'comprobante 17', 'factura de proveedor X', "
+                "'compras pendientes de pago', 'qué facturas debo'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "invoice_number": {
+                        "type": "string",
+                        "description": "Número de comprobante (ej: 0002-00000017). Búsqueda parcial tolerada.",
+                    },
+                },
+                "required": ["invoice_number"],
             },
         },
     },
@@ -1979,6 +2005,105 @@ def _resolve_invoice_id_by_number(invoice_number: str) -> str | None:
     r = client.table(table).select("id").filter(number_c, "eq", invoice_number.strip()).limit(1).execute()
     rows = r.data or []
     return str(rows[0]["id"]) if rows and rows[0].get("id") else None
+
+
+# ── Facturas de compra (payable_invoices) ────────────────────────────────────
+
+def _payable_invoices_table() -> str:
+    t = _tenant_env("PAYABLE_INVOICES_TABLE", "payable_invoices").strip() or "payable_invoices"
+    if not _safe_sql_identifier(t):
+        raise ValueError(f"ERP_SUPABASE_PAYABLE_INVOICES_TABLE inválido: {t!r}")
+    return t
+
+
+def _stub_get_purchase_invoice(invoice_number: str) -> dict[str, Any]:
+    return {
+        "invoice_number_buscado": invoice_number,
+        "tipo_comprobante": "factura_compra",
+        "resultados": [
+            {
+                "numero_factura": invoice_number,
+                "tipo": "factura_a",
+                "fecha_emision": "2025-01-15",
+                "fecha_vencimiento": "2025-02-15",
+                "total": 50000.0,
+                "pagado": 30000.0,
+                "pendiente": 20000.0,
+                "estado": "pending",
+                "proveedor": "Proveedor Demo S.A.",
+                "cuit_proveedor": "30-12345678-9",
+                "moneda": "ARS",
+            }
+        ],
+        "fuente": "stub",
+        "nota": "definí SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY para leer Postgres",
+    }
+
+
+def _get_purchase_invoice_from_supabase(invoice_number: str) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _payable_invoices_table()
+    pat = f"%{invoice_number.strip()}%"
+    base_cols = (
+        "id,invoice_number,invoice_type,document_type,issue_date,due_date,"
+        "total_amount,paid_amount,remaining_amount,status,currency,notes"
+    )
+    # Intentar join con suppliers vía FK conocida; fallback sin join si falla
+    select_with_supplier = f"{base_cols},suppliers!fk_payable_invoices_supplier(business_name,tax_id)"
+    rows: list[dict[str, Any]] = []
+    supplier_joined = True
+    try:
+        r = client.table(table).select(select_with_supplier).ilike("invoice_number", pat).limit(10).execute()
+        rows = r.data or []
+    except Exception:
+        supplier_joined = False
+        try:
+            r = client.table(table).select(base_cols).ilike("invoice_number", pat).limit(10).execute()
+            rows = r.data or []
+        except Exception as e:
+            return {"error": f"Error consultando facturas de compra: {e}"}
+
+    if not rows:
+        return {
+            "invoice_number_buscado": invoice_number,
+            "tipo_comprobante": "factura_compra",
+            "resultados": [],
+            "nota": "No se encontraron facturas de compra con ese número",
+        }
+
+    resultados = []
+    for row in rows:
+        supplier: dict[str, Any] = {}
+        if supplier_joined:
+            raw = row.get("suppliers") or {}
+            supplier = raw[0] if isinstance(raw, list) and raw else (raw if isinstance(raw, dict) else {})
+        entry: dict[str, Any] = {
+            "numero_factura": row.get("invoice_number"),
+            "tipo": row.get("invoice_type"),
+            "fecha_emision": row.get("issue_date"),
+            "fecha_vencimiento": row.get("due_date"),
+            "total": row.get("total_amount"),
+            "pagado": row.get("paid_amount"),
+            "pendiente": row.get("remaining_amount"),
+            "estado": row.get("status"),
+            "moneda": row.get("currency"),
+        }
+        if row.get("document_type"):
+            entry["documento"] = row["document_type"]
+        if supplier.get("business_name"):
+            entry["proveedor"] = supplier["business_name"]
+        if supplier.get("tax_id"):
+            entry["cuit_proveedor"] = supplier["tax_id"]
+        if row.get("notes"):
+            entry["notas"] = row["notes"]
+        resultados.append(entry)
+
+    return {
+        "invoice_number_buscado": invoice_number,
+        "tipo_comprobante": "factura_compra",
+        "resultados": resultados,
+    }
 
 
 # ── Facturas: stubs ─────────────────────────────────────────────────────────
@@ -3812,6 +3937,80 @@ def _customers_from_supabase(query: str, limit: int) -> dict[str, Any]:
     }
 
 
+def _product_lp_stock_config() -> tuple[str, str, str, str, str, list[str]] | None:
+    """Devuelve config para stock de productos en liquidaciones (LP), o None si está deshabilitado.
+
+    Habilitar con: ERP_{DB_KEY}_PRODUCT_INCLUDE_LP_STOCK=true
+    Tablas/columnas configurables via _tenant_env con prefijo LP_* .
+    """
+    enabled = _tenant_env("PRODUCT_INCLUDE_LP_STOCK", "").strip().lower()
+    if enabled not in ("true", "1", "yes"):
+        return None
+    lp_items_t = _tenant_env("LP_ITEMS_TABLE", "liquid_product_items").strip() or "liquid_product_items"
+    pid_c = _tenant_env("LP_ITEMS_PRODUCT_ID_COL", "product_id").strip() or "product_id"
+    qty_c = _tenant_env("LP_ITEMS_QTY_COL", "remaining_quantity").strip() or "remaining_quantity"
+    lp_t = _tenant_env("LP_TABLE", "liquid_products").strip() or "liquid_products"
+    status_c = _tenant_env("LP_STATUS_COL", "liquidation_status").strip() or "liquidation_status"
+    statuses_raw = _tenant_env("LP_ACTIVE_STATUSES", "pending,active")
+    statuses = [s.strip() for s in statuses_raw.split(",") if s.strip()]
+    return lp_items_t, pid_c, qty_c, lp_t, status_c, statuses
+
+
+def _enrich_rows_with_stock(
+    client: Any,
+    rows: list[dict[str, Any]],
+    product_ids: list[Any],
+) -> None:
+    """Agrega stock_total y stock_disponible a cada row de productos (in-place).
+
+    Consulta warehouse_stock. Si ERP_{DB_KEY}_PRODUCT_INCLUDE_LP_STOCK=true,
+    también suma el stock de liquidaciones pendientes/activas (liquid_product_items).
+    Falla silenciosamente: si hay error de DB, los rows no se modifican.
+    """
+    try:
+        ws_table, ws_prod_c, _, ws_stock_c, ws_reserved_c, _, _ = _warehouse_stock_column_config()
+        r = client.table(ws_table).select(f"{ws_prod_c},{ws_stock_c},{ws_reserved_c}").in_(ws_prod_c, product_ids).execute()
+        ws_by_pid: dict[Any, tuple[float, float]] = {}
+        for ws_row in r.data or []:
+            pid = ws_row.get(ws_prod_c)
+            if pid is None:
+                continue
+            prev_s, prev_r = ws_by_pid.get(pid, (0.0, 0.0))
+            ws_by_pid[pid] = (prev_s + _to_float(ws_row.get(ws_stock_c)), prev_r + _to_float(ws_row.get(ws_reserved_c)))
+    except Exception as e:
+        print(f"[DEBUG] _enrich_rows_with_stock: warehouse_stock falló: {e}", flush=True)
+        return
+
+    lp_by_pid: dict[Any, float] = {}
+    lp_cfg = _product_lp_stock_config()
+    if lp_cfg is not None:
+        lp_items_t, lp_pid_c, lp_qty_c, lp_t, lp_status_c, lp_statuses = lp_cfg
+        try:
+            lp_select = f"{lp_pid_c},{lp_qty_c},{lp_t}!inner({lp_status_c})"
+            lr = client.table(lp_items_t).select(lp_select).in_(lp_pid_c, product_ids).gt(lp_qty_c, 0).execute()
+            for lp_item in lr.data or []:
+                lp_meta = lp_item.get(lp_t, {})
+                if isinstance(lp_meta, list):
+                    lp_meta = lp_meta[0] if lp_meta else {}
+                if lp_meta.get(lp_status_c) not in lp_statuses:
+                    continue
+                pid = lp_item.get(lp_pid_c)
+                if pid is None:
+                    continue
+                lp_by_pid[pid] = lp_by_pid.get(pid, 0.0) + _to_float(lp_item.get(lp_qty_c))
+        except Exception as e:
+            print(f"[DEBUG] _enrich_rows_with_stock: lp_stock falló: {e}", flush=True)
+
+    for row in rows:
+        pid = row.get("id")
+        if pid is None:
+            continue
+        ws_stock, ws_reserved = ws_by_pid.get(pid, (0.0, 0.0))
+        lp_stock = lp_by_pid.get(pid, 0.0)
+        row["stock_total"] = ws_stock + lp_stock
+        row["stock_disponible"] = (ws_stock - ws_reserved) + lp_stock
+
+
 def _products_from_supabase(query: str, limit: int) -> dict[str, Any]:
     client = _get_supabase()
     assert client is not None
@@ -3852,6 +4051,12 @@ def _products_from_supabase(query: str, limit: int) -> dict[str, Any]:
         if unit_c and unit_c in row and row.get(unit_c):
             item["unidad_venta"] = row[unit_c]
         rows.append(item)
+    # Enriquecer con stock actual si está habilitado (ERP_{DB_KEY}_PRODUCT_INCLUDE_STOCK=true)
+    include_stock = _tenant_env("PRODUCT_INCLUDE_STOCK", "").strip().lower() in ("true", "1", "yes")
+    if include_stock and uuid_c and rows:
+        product_ids = [row["id"] for row in rows if row.get("id") is not None]
+        if product_ids:
+            _enrich_rows_with_stock(client, rows, product_ids)
     return {
         "query": query,
         "resultados": rows,
@@ -3905,6 +4110,19 @@ def _product_available_stock_from_supabase(query: str, limit: int) -> dict[str, 
     product_map: dict[Any, dict[str, Any]] = {row.get(uuid_c): row for row in product_rows if row.get(uuid_c) is not None}
     product_ids = list(product_map.keys())
 
+    # Obtener unidad de venta para mostrar junto al stock
+    unit_c = _product_col_sale_unit()
+    unit_map: dict[Any, str] = {}
+    try:
+        ur = _get_supabase().table(_products_table()).select(f"{uuid_c},{unit_c}").in_(uuid_c, product_ids).execute()  # type: ignore[union-attr]
+        for urow in ur.data or []:
+            pid = urow.get(uuid_c)
+            u = urow.get(unit_c)
+            if pid is not None and u:
+                unit_map[pid] = str(u)
+    except Exception:
+        pass
+
     ws_table, ws_product_c, ws_warehouse_c, ws_stock_c, ws_reserved_c, ws_min_c, ws_projected_c = (
         _warehouse_stock_column_config()
     )
@@ -3951,18 +4169,19 @@ def _product_available_stock_from_supabase(query: str, limit: int) -> dict[str, 
                 }
             )
 
-        out.append(
-            {
-                "sku": product.get(code_c),
-                "nombre": product.get(name_c),
-                "stock_total": stock_total,
-                "stock_reservado": reserved_total,
-                "stock_disponible": stock_total - reserved_total,
-                "min_stock": min_total,
-                "stock_proyectado": projected_total,
-                "depositos": [{k: v for k, v in d.items() if k != "warehouse_id" or len(depots) > 1} for d in depots],
-            }
-        )
+        entry: dict[str, Any] = {
+            "sku": product.get(code_c),
+            "nombre": product.get(name_c),
+            "stock_total": stock_total,
+            "stock_reservado": reserved_total,
+            "stock_disponible": stock_total - reserved_total,
+            "min_stock": min_total,
+            "stock_proyectado": projected_total,
+            "depositos": [{k: v for k, v in d.items() if k != "warehouse_id" or len(depots) > 1} for d in depots],
+        }
+        if pid in unit_map:
+            entry["unidad_venta"] = unit_map[pid]
+        out.append(entry)
     return {
         "query": query,
         "resultados": out,
@@ -5155,6 +5374,11 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
                 result = _list_customer_invoice_items_from_supabase(inv_id, lim)
             else:
                 result = _stub_list_customer_invoice_items(inv_id, lim)
+        elif name == "get_purchase_invoice":
+            inv_num = str(args.get("invoice_number") or "").strip()
+            if not inv_num:
+                return json.dumps({"error": "Requerido: invoice_number"}, ensure_ascii=False)
+            result = _get_purchase_invoice_from_supabase(inv_num) if use_sb else _stub_get_purchase_invoice(inv_num)
         elif name == "list_customer_payments":
             lim = _coerce_limit(args.get("limit"), default=50, cap=200)
             inv_id = str(args.get("invoice_id") or "").strip()
