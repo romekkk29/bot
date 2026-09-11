@@ -714,6 +714,46 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_purchase_invoices",
+            "description": (
+                "Lista facturas de COMPRA recibidas de proveedores (payable_invoices / BN1 / BN2) en un rango de fechas. "
+                "Devuelve: número, tipo, fecha emisión, vencimiento, total, pagado, saldo pendiente, estado, proveedor. "
+                "Usar cuando el usuario pida: 'compras del día', 'facturas de proveedores', 'qué compramos hoy/esta semana', "
+                "'facturas pendientes de pago', 'cuánto debemos', 'compras de tal proveedor'. "
+                "NO confundir con list_purchase_orders (órdenes de compra / OC). "
+                "Llamar con limit=10 por defecto."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "desde": {
+                        "type": "string",
+                        "description": "Fecha inicio YYYY-MM-DD (issue_date)",
+                    },
+                    "hasta": {
+                        "type": "string",
+                        "description": "Fecha fin YYYY-MM-DD (default hoy)",
+                    },
+                    "supplier_name": {
+                        "type": "string",
+                        "description": "Nombre parcial del proveedor para filtrar (opcional)",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Estado a filtrar: pending, paid, overdue, cancelled (opcional)",
+                    },
+                    "limit": {
+                        "anyOf": [{"type": "integer"}, {"type": "string"}],
+                        "description": "Máximo de resultados (default 10)",
+                    },
+                },
+                "required": ["desde"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_customer_invoice_items",
             "description": (
                 "Lista los ítems/líneas de una factura de cliente específica. "
@@ -1927,7 +1967,7 @@ def _invoice_number_column() -> str:
 
 def _invoices_select_expr() -> str:
     default = "id,invoice_number,issue_date,due_date,total_amount,paid_amount,remaining_amount,status,currency,receipt_type,customer_id"
-    s = (os.environ.get("ERP_SUPABASE_INVOICES_SELECT") or default).strip() or default
+    s = (_tenant_env("INVOICES_SELECT", default) or default).strip() or default
     parts = [p.strip() for p in s.split(",") if p.strip()]
     for p in parts:
         if not _safe_sql_identifier(p):
@@ -2103,6 +2143,128 @@ def _get_purchase_invoice_from_supabase(invoice_number: str) -> dict[str, Any]:
         "invoice_number_buscado": invoice_number,
         "tipo_comprobante": "factura_compra",
         "resultados": resultados,
+    }
+
+
+def _list_purchase_invoices_from_supabase(
+    desde: str,
+    hasta: str,
+    limit: int,
+    supplier_name: str | None = None,
+    filter_status: str | None = None,
+) -> dict[str, Any]:
+    client = _get_supabase()
+    assert client is not None
+    table = _payable_invoices_table()
+    date_c = "issue_date"
+    desde_f, hasta_f = _date_range_bounds(desde, hasta)
+    base_cols = (
+        "id,invoice_number,invoice_type,document_type,issue_date,due_date,"
+        "total_amount,paid_amount,remaining_amount,status,currency"
+    )
+    select_with_supplier = f"{base_cols},suppliers!fk_payable_invoices_supplier(business_name,tax_id)"
+    lim = max(1, min(limit, 200))
+
+    def _build_q(select: str):
+        q = (
+            client.table(table)
+            .select(select)
+            .gte(date_c, desde_f)
+            .lte(date_c, hasta_f)
+        )
+        if filter_status:
+            q = q.eq("status", filter_status)
+        else:
+            q = q.not_.in_("status", ["cancelled"])
+        return q
+
+    rows: list[dict[str, Any]] = []
+    supplier_joined = True
+    try:
+        r = _build_q(select_with_supplier).order(date_c, desc=True).limit(lim).execute()
+        rows = r.data or []
+    except Exception:
+        supplier_joined = False
+        try:
+            r = _build_q(base_cols).order(date_c, desc=True).limit(lim).execute()
+            rows = r.data or []
+        except Exception as e:
+            return {"error": f"Error consultando facturas de compra: {e}"}
+
+    # Filtrar por nombre de proveedor client-side si se pidió y el join funcionó
+    if supplier_name and supplier_joined:
+        needle = supplier_name.strip().lower()
+        rows = [
+            row for row in rows
+            if needle in (((row.get("suppliers") or {}).get("business_name") or "")).lower()
+        ]
+
+    total_en_bd: int | None = None
+    try:
+        cr = _build_q("id").execute()
+        total_en_bd = cr.count if hasattr(cr, "count") and cr.count is not None else None
+        if total_en_bd is None and isinstance(cr.data, list):
+            total_en_bd = len(cr.data)
+    except Exception:
+        pass
+
+    resultados = []
+    for row in rows:
+        supplier: dict[str, Any] = {}
+        if supplier_joined:
+            raw = row.get("suppliers") or {}
+            supplier = raw[0] if isinstance(raw, list) and raw else (raw if isinstance(raw, dict) else {})
+        entry: dict[str, Any] = {
+            "numero_factura": row.get("invoice_number"),
+            "tipo": row.get("invoice_type"),
+            "fecha_emision": row.get("issue_date"),
+            "fecha_vencimiento": row.get("due_date"),
+            "total": row.get("total_amount"),
+            "pagado": row.get("paid_amount"),
+            "pendiente": row.get("remaining_amount"),
+            "estado": row.get("status"),
+            "moneda": row.get("currency"),
+        }
+        if row.get("document_type"):
+            entry["documento"] = row["document_type"]
+        if supplier.get("business_name"):
+            entry["proveedor"] = supplier["business_name"]
+        if supplier.get("tax_id"):
+            entry["cuit_proveedor"] = supplier["tax_id"]
+        resultados.append(entry)
+
+    out: dict[str, Any] = {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "tipo_comprobante": "facturas_compra",
+        "resultados": resultados,
+        "cantidad_devuelta": len(resultados),
+        "limite": lim,
+    }
+    if total_en_bd is not None:
+        out["total_en_bd"] = total_en_bd
+        out["hay_mas"] = total_en_bd > lim
+    return out
+
+
+def _stub_list_purchase_invoices(desde: str, hasta: str, limit: int) -> dict[str, Any]:
+    return {
+        "periodo": {"desde": desde, "hasta": hasta},
+        "tipo_comprobante": "facturas_compra",
+        "resultados": [
+            {
+                "numero_factura": "0002-00000017",
+                "tipo": "factura_a",
+                "fecha_emision": desde,
+                "fecha_vencimiento": desde,
+                "total": 50000.0,
+                "pagado": 0.0,
+                "pendiente": 50000.0,
+                "estado": "pending",
+                "proveedor": "Proveedor Demo S.A.",
+                "moneda": "ARS",
+            }
+        ],
+        "fuente": "stub",
     }
 
 
@@ -5379,6 +5541,18 @@ def dispatch_tool(name: str, arguments_json: str) -> str:
             if not inv_num:
                 return json.dumps({"error": "Requerido: invoice_number"}, ensure_ascii=False)
             result = _get_purchase_invoice_from_supabase(inv_num) if use_sb else _stub_get_purchase_invoice(inv_num)
+        elif name == "list_purchase_invoices":
+            lim = _coerce_limit(args.get("limit"), default=10, cap=200)
+            try:
+                desde, hasta = _resolve_orders_list_dates(args.get("desde"), args.get("hasta"))
+            except ValueError as e:
+                return json.dumps({"error": str(e)}, ensure_ascii=False)
+            sup_name = str(args.get("supplier_name") or "").strip() or None
+            filter_status = str(args.get("status") or "").strip() or None
+            if use_sb:
+                result = _list_purchase_invoices_from_supabase(desde, hasta, lim, sup_name, filter_status)
+            else:
+                result = _stub_list_purchase_invoices(desde, hasta, lim)
         elif name == "list_customer_payments":
             lim = _coerce_limit(args.get("limit"), default=50, cap=200)
             inv_id = str(args.get("invoice_id") or "").strip()
